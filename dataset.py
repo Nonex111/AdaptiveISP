@@ -19,6 +19,7 @@ from yolov3.utils.general import (DATASETS_DIR, LOGGER, NUM_THREADS, TQDM_BAR_FO
 
 from isp.unprocess_np import unprocess_wo_mosaic
 from util import AsyncTaskManager
+from common.raw_reader import process_hq_dng_file
 
 from multiprocessing.pool import Pool, ThreadPool
 from tqdm import tqdm
@@ -72,18 +73,22 @@ class LoadImagesAndLabelsRAW(LoadImagesAndLabels):
 
         hyp = self.hyp
 
-        # Load image
+        # Load image (DNG will be read via raw_reader to keep linear range)
         img, (h0, w0), (h, w) = self.load_image(index)
-        img = img[..., ::-1]  # BGR to RGB uint8
-        img = img / 255.0  # uint8 to float
+        is_raw = np.issubdtype(img.dtype, np.floating) and img.max() <= 1.5
+        if is_raw:
+            img = img.astype(np.float32)  # already RGB, 0-1
+        else:
+            img = img[..., ::-1].astype(np.float32) / 255.0  # BGR uint8 -> RGB float
 
         # rgb_img = img
         # rgb_img = rgb_img.transpose((2, 0, 1))  # HWC to CHW
-        # TODO add unprocess
-        if not self.train:
-            seed = int(os.path.splitext(os.path.split(self.im_files[index])[1])[0])
-            np.random.seed(seed)
-        img, _ = unprocess_wo_mosaic(img, self.add_noise, self.brightness_range, self.noise_level, self.use_linear)  # RGB to linear RGB
+        if not is_raw:
+            # Only unprocess sRGB; raw reader already returns linear RGB
+            if not self.train:
+                seed = int(os.path.splitext(os.path.split(self.im_files[index])[1])[0])
+                np.random.seed(seed)
+            img, _ = unprocess_wo_mosaic(img, self.add_noise, self.brightness_range, self.noise_level, self.use_linear)  # RGB to linear RGB
 
         # Letterbox
         shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
@@ -146,6 +151,31 @@ class LoadImagesAndLabelsRAW(LoadImagesAndLabels):
         # shapes: (h0, w0), ((h / h0, w / w0), pad)
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
 
+    def load_image(self, i):
+        # Prefer raw_reader for DNG to keep linear RAW; fallback to default loader
+        f = self.im_files[i]
+        if f.lower().endswith('.dng'):
+            raw = process_hq_dng_file(f, output_channels=3)
+            if raw is not None:
+                img = raw.squeeze(0).permute(1, 2, 0).numpy()  # HWC RGB float32 0-1
+                h0, w0 = img.shape[:2]
+                r = self.img_size / max(h0, w0)  # ratio
+                if r != 1:
+                    interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                    img = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+                return img, (h0, w0), img.shape[:2]
+            LOGGER.warning(f'Falling back to cv2 for RAW read failure: {f}')
+            img = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise FileNotFoundError(f'Image Not Found {f}')
+            h0, w0 = img.shape[:2]
+            r = self.img_size / max(h0, w0)
+            if r != 1:
+                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                img = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+            return img, (h0, w0), img.shape[:2]
+        return super().load_image(i)
+
     @staticmethod
     def collate_fn_raw(batch):
         im, label, path, shapes = batch  # transposed
@@ -193,17 +223,22 @@ class LoadImagesAndLabelsRAWV2(LoadImagesAndLabels):
 
         # Load image
         img, (h0, w0), (h, w) = self.load_image(index)
-        img = img[..., ::-1]  # BGR to RGB uint8
-        img = img / 255.0  # uint8 to float
+        is_raw = np.issubdtype(img.dtype, np.floating) and img.max() <= 1.5
+        if is_raw:
+            img = (img * 65535).astype(np.uint16)  # keep high dynamic range, match downstream scale
+        else:
+            img = img[..., ::-1]  # BGR to RGB uint8
+            img = img / 255.0  # uint8 to float
 
         # rgb_img = img
         # rgb_img = rgb_img.transpose((2, 0, 1))  # HWC to CHW
         # TODO add unprocess
-        if not self.train:
-            seed = int(os.path.splitext(os.path.split(self.im_files[index])[1])[0])
-            np.random.seed(seed)
-        img, _ = unprocess_wo_mosaic(img, self.add_noise, self.brightness_range, self.noise_level, self.use_linear)  # RGB to linear RGB
-        img = (img * 65535).astype(np.uint16)
+        if not is_raw:
+            if not self.train:
+                seed = int(os.path.splitext(os.path.split(self.im_files[index])[1])[0])
+                np.random.seed(seed)
+            img, _ = unprocess_wo_mosaic(img, self.add_noise, self.brightness_range, self.noise_level, self.use_linear)  # RGB to linear RGB
+            img = (img * 65535).astype(np.uint16)
 
         # Letterbox
         shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
@@ -267,6 +302,30 @@ class LoadImagesAndLabelsRAWV2(LoadImagesAndLabels):
         # shapes: (h0, w0), ((h / h0, w / w0), pad)
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
 
+    def load_image(self, i):
+        f = self.im_files[i]
+        if f.lower().endswith('.dng'):
+            raw = process_hq_dng_file(f, output_channels=3)
+            if raw is not None:
+                img = raw.squeeze(0).permute(1, 2, 0).numpy()  # HWC RGB float32 0-1
+                h0, w0 = img.shape[:2]
+                r = self.img_size / max(h0, w0)  # ratio
+                if r != 1:
+                    interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                    img = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+                return img, (h0, w0), img.shape[:2]
+            LOGGER.warning(f'Falling back to cv2 for RAW read failure: {f}')
+            img = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise FileNotFoundError(f'Image Not Found {f}')
+            h0, w0 = img.shape[:2]
+            r = self.img_size / max(h0, w0)
+            if r != 1:
+                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                img = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+            return img, (h0, w0), img.shape[:2]
+        return super().load_image(i)
+
     @staticmethod
     def collate_fn_raw(batch):
         im, label, path, shapes = batch  # transposed
@@ -314,16 +373,20 @@ class LoadImagesAndLabelsRAWHR(LoadImagesAndLabels):
 
         # Load image
         img, (h0, w0), (h, w) = self.load_image(index)
-        img = img[..., ::-1]  # BGR to RGB uint8
-        img = img / 255.0  # uint8 to float
+        is_raw = np.issubdtype(img.dtype, np.floating) and img.max() <= 1.5
+        if is_raw:
+            img = img.astype(np.float32)  # already RGB 0-1
+        else:
+            img = img[..., ::-1].astype(np.float32) / 255.0  # BGR -> RGB float
 
         # rgb_img = img
         # rgb_img = rgb_img.transpose((2, 0, 1))  # HWC to CHW
         # TODO add unprocess
-        if not self.train:
-            seed = int(os.path.splitext(os.path.split(self.im_files[index])[1])[0])
-            np.random.seed(seed)
-        img, _ = unprocess_wo_mosaic(img, self.add_noise, self.brightness_range, self.noise_level, self.use_linear)  # RGB to linear RGB
+        if not is_raw:
+            if not self.train:
+                seed = int(os.path.splitext(os.path.split(self.im_files[index])[1])[0])
+                np.random.seed(seed)
+            img, _ = unprocess_wo_mosaic(img, self.add_noise, self.brightness_range, self.noise_level, self.use_linear)  # RGB to linear RGB
         img_hr = img.copy()
 
         # Letterbox
@@ -421,6 +484,29 @@ class LoadImagesAndLabelsRAWHR(LoadImagesAndLabels):
     #         #     im = cv2.resize(im, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
     #         return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
     #     return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
+    def load_image(self, i):
+        f = self.im_files[i]
+        if f.lower().endswith('.dng'):
+            raw = process_hq_dng_file(f, output_channels=3)
+            if raw is not None:
+                img = raw.squeeze(0).permute(1, 2, 0).numpy()  # HWC RGB float32 0-1
+                h0, w0 = img.shape[:2]
+                r = self.img_size / max(h0, w0)  # ratio
+                if r != 1:
+                    interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                    img = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+                return img, (h0, w0), img.shape[:2]
+            LOGGER.warning(f'Falling back to cv2 for RAW read failure: {f}')
+            img = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise FileNotFoundError(f'Image Not Found {f}')
+            h0, w0 = img.shape[:2]
+            r = self.img_size / max(h0, w0)
+            if r != 1:
+                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                img = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+            return img, (h0, w0), img.shape[:2]
+        return super().load_image(i)
 
 
 class LoadImagesAndLabelsRAWReplay(LoadImagesAndLabels):
@@ -460,15 +546,18 @@ class LoadImagesAndLabelsRAWReplay(LoadImagesAndLabels):
 
         hyp = self.hyp
 
-        # Load image
+        # Load image (prefer RAW pipeline for DNG)
         img, (h0, w0), (h, w) = self.load_image(index)
-        img = img[..., ::-1]  # BGR to RGB uint8
-        img = img / 255.0  # uint8 to float
+        is_raw = np.issubdtype(img.dtype, np.floating) and img.max() <= 1.5
+        if is_raw:
+            img = img.astype(np.float32)  # already RGB 0-1
+        else:
+            img = img[..., ::-1].astype(np.float32) / 255.0  # BGR uint8 -> RGB float
 
         # rgb_img = img
         # rgb_img = rgb_img.transpose((2, 0, 1))  # HWC to CHW
-        # TODO add unprocess
-        img, _ = unprocess_wo_mosaic(img, self.add_noise, self.brightness_range, self.noise_level, self.use_linear)  # RGB to linear RGB
+        if not is_raw:
+            img, _ = unprocess_wo_mosaic(img, self.add_noise, self.brightness_range, self.noise_level, self.use_linear)  # RGB to linear RGB
 
         # Letterbox
         shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
@@ -530,6 +619,31 @@ class LoadImagesAndLabelsRAWReplay(LoadImagesAndLabels):
         # file path
         # shapes: (h0, w0), ((h / h0, w / w0), pad)
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes
+
+    def load_image(self, i):
+        # Prefer raw_reader for DNG to keep linear RAW; fallback to default loader
+        f = self.im_files[i]
+        if f.lower().endswith('.dng'):
+            raw = process_hq_dng_file(f, output_channels=3)
+            if raw is not None:
+                img = raw.squeeze(0).permute(1, 2, 0).numpy()  # HWC RGB float32 0-1
+                h0, w0 = img.shape[:2]
+                r = self.img_size / max(h0, w0)  # ratio
+                if r != 1:
+                    interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                    img = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+                return img, (h0, w0), img.shape[:2]
+            LOGGER.warning(f'Falling back to cv2 for RAW read failure: {f}')
+            img = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise FileNotFoundError(f'Image Not Found {f}')
+            h0, w0 = img.shape[:2]
+            r = self.img_size / max(h0, w0)
+            if r != 1:
+                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                img = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+            return img, (h0, w0), img.shape[:2]
+        return super().load_image(i)
 
     @staticmethod
     def collate_fn_raw(batch):
@@ -1710,6 +1824,3 @@ if __name__ == "__main__":
     print(len(dataset))
     print(dataset.get_next_batch_(batch_size))
     exit()
-
-
-

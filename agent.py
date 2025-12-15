@@ -62,7 +62,7 @@ class FeatureExtractor(torch.nn.Module):
 
 # Output: float \in [0, 1]
 class Agent(nn.Module):
-    def __init__(self, cfg, shape=(16, 64, 64), device='cuda'):
+    def __init__(self, cfg, shape=(16, 64, 64), device='cuda', meta_ccm=None):
         super(Agent, self).__init__()
         self.cfg = cfg
         self.feature_extractor = FeatureExtractor(shape=shape, mid_channels=cfg.base_channels,
@@ -70,7 +70,10 @@ class Agent(nn.Module):
                                                   dropout_prob=1.0 - cfg.dropout_keep_prob)
         self.filters = []
         for func in self.cfg.filters:
-            filter = func(self.cfg, predict=True).to(device)
+            if func.__name__ == 'CCMFilter':
+                filter = func(self.cfg, predict=True, meta_ccm=meta_ccm).to(device)
+            else:
+                filter = func(self.cfg, predict=True).to(device)
             self.__setattr__(filter.get_short_name(), filter)
             self.filters.append(filter)
 
@@ -295,7 +298,7 @@ if __name__ == "__main__":
     from config import cfg
     print(cfg.curve_steps)
     batch = 1
-    agent = Agent(cfg, (64, 64), 'cpu')
+    agent = Agent(cfg, (64, 64), 'cpu', meta_ccm=cfg.meta_ccm)
     x = torch.randn((batch, 3, 512, 512))
     z = torch.randn((batch, cfg.z_dim))
     states = torch.randn((batch, cfg.num_state_dim))

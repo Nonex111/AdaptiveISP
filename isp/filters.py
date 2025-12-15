@@ -693,19 +693,28 @@ def test_color_correction_matrix():
 
 class CCMFilter(Filter):
 
-    def __init__(self, cfg, predict=False):
+    def __init__(self, cfg, predict=False, meta_ccm=None):
         Filter.__init__(self, cfg, 'CCM', 9, predict)
+        if meta_ccm is not None:
+            base = np.array(meta_ccm, dtype=np.float32).reshape(1, 9)
+        else:
+            base = np.eye(3, dtype=np.float32).reshape(1, 9)
+        self.register_buffer("meta_ccm", torch.from_numpy(base))
 
     def filter_param_regressor(self, features):
-        ccm = tanh_range(*self.cfg.ccm_range)(features)
-        return ccm
+        # Predict delta relative to metadata CCM
+        delta_ccm = tanh_range(*self.cfg.ccm_range)(features)
+        return delta_ccm
 
     def process(self, img, param):
-        # param  [batch, 9]
+        # param  [batch, 9] (delta)
         # img [batch, 3, H, W]
-        param = torch.reshape(param, shape=(-1, 3, 3))
-        param = param / torch.sum(param, dim=-1, keepdim=True)
-        return color_correction_matrix(img, param)
+        batch = param.shape[0]
+        base = self.meta_ccm.to(param.device).expand(batch, -1)
+        ccm = base + param
+        ccm = torch.reshape(ccm, shape=(-1, 3, 3))
+        ccm = ccm / torch.sum(ccm, dim=-1, keepdim=True)
+        return color_correction_matrix(img, ccm)
 
     def visualize_filter(self, debug_info, canvas):
         ccm = debug_info['filter_parameters'].detach().cpu().numpy()  # [9]

@@ -150,7 +150,7 @@ class DynamicISP:
         self.yolo_model = yolo_model
         self.data_dict = data_dict
 
-        self.agent = Agent(cfg, shape=(6 + len(cfg.filters), 64, 64)).to(self.device)
+        self.agent = Agent(cfg, shape=(6 + len(cfg.filters), 64, 64), meta_ccm=cfg.meta_ccm).to(self.device)
         self.value = Value(cfg, shape=(9 + len(cfg.filters), 64, 64)).to(self.device)
         self.args = args
         cfg.max_iter_step = int(self.args.epochs * 1000 // args.batch_size)  # 1000 train images
@@ -342,8 +342,8 @@ class DynamicISP:
             agent_loss.backward(retain_graph=False)
 
             # clip gradient
-            torch.nn.utils.clip_grad_norm(self.agent.parameters(), 1e-5)
-            torch.nn.utils.clip_grad_norm(self.value.parameters(), 1e-5)
+            torch.nn.utils.clip_grad_norm(self.agent.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm(self.value.parameters(), 1.0)
 
             agent_optimizer.step()
             value_optimizer.step()
@@ -610,7 +610,7 @@ class DynamicISP:
             #                 names)  # pred
         torch.cuda.empty_cache()
 
-
+#PYTHONPATH=.. python train.py --data_cfg yolov3/data/lod.yaml --task train_val --data_name lod --weights /root/autodl-tmp/yolov3.pt --yolo_cfg yolov3/models/yolov3.yaml --hyp yolov3/data/hyps/hyp.scratch-low.yaml  --resume experiments/lod-adaptiveisp/ckpt/DynamicISP_iter_41000.pth
 if __name__ == "__main__":
     import argparse
 
@@ -631,7 +631,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--save_path", type=str, default='adaptiveisp', help="save path at experiments/save_path/")
     parser.add_argument("--data_name", type=str, default='lod', choices=['lod', ], help="train data: lod")
-    parser.add_argument('--data_cfg', type=str, default='yolov3/data/lod.yaml', help='dataset.yaml path')
+    parser.add_argument('--data_cfg', type=str, default='data/lod.yaml', help='dataset.yaml path (relative to yolov3)')
     parser.add_argument("--add_noise", type=bool, default=False, help="add_noise")
     parser.add_argument("--use_linear", action='store_true', default=False, help="use linear noise distribution")
     parser.add_argument("--bri_range", type=float, default=None, nargs='*', help="brightness range, (low, high), 0.0~1.0")

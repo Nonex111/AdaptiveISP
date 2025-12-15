@@ -27,6 +27,10 @@ import yaml
 from PIL import ExifTags, Image, ImageOps
 from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
+try:
+    from common.raw_reader import process_hq_dng_file
+except Exception:
+    process_hq_dng_file = None
 
 from utils.augmentations import (Albumentations, augment_hsv, classify_albumentations, classify_transforms, copy_paste,
                                  letterbox, mixup, random_perspective)
@@ -433,7 +437,7 @@ def img2label_paths(img_paths, img_dir_name="images"):
 
 class LoadImagesAndLabels(Dataset):
     # YOLOv3 train_loader/val_loader, loads images and labels for training and validation
-    cache_version = 0.6  # dataset labels *.cache version
+    cache_version = 0.7  # dataset labels *.cache version
     rand_interp_methods = [cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4]
 
     def __init__(self,
@@ -616,7 +620,7 @@ class LoadImagesAndLabels(Dataset):
         x = {}  # dict
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
         desc = f'{prefix}Scanning {path.parent / path.stem}...'
-        with Pool(NUM_THREADS) as pool:
+        with ThreadPool(NUM_THREADS) as pool:
             pbar = tqdm(pool.imap(verify_image_label, zip(self.im_files, self.label_files, repeat(prefix))),
                         desc=desc,
                         total=len(self.im_files),
@@ -739,8 +743,18 @@ class LoadImagesAndLabels(Dataset):
             if fn.exists():  # load npy
                 im = np.load(fn)
             else:  # read image
-                im = cv2.imread(f)  # BGR
-                assert im is not None, f'Image Not Found {f}'
+                ext = Path(f).suffix.lower()
+                if ext == '.dng':
+                    if process_hq_dng_file is None:
+                        raise RuntimeError('process_hq_dng_file unavailable. Ensure PYTHONPATH includes project root and raw dependencies are installed.')
+                    dng_tensor = process_hq_dng_file(f)
+                    assert dng_tensor is not None, f'process_hq_dng_file returned None: {f}'
+                    np_im = dng_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                    np_im = (np_im.clip(0.0, 1.0) * 255.0).astype(np.uint8)
+                    im = cv2.cvtColor(np_im, cv2.COLOR_RGB2BGR)
+                else:
+                    im = cv2.imread(f)  # BGR
+                    assert im is not None, f'Image Not Found {f}'
             h0, w0 = im.shape[:2]  # orig hw
             r = self.img_size / max(h0, w0)  # ratio
             if r != 1:  # if sizes are not equal
@@ -753,7 +767,15 @@ class LoadImagesAndLabels(Dataset):
         # Saves an image as an *.npy file for faster loading
         f = self.npy_files[i]
         if not f.exists():
-            np.save(f.as_posix(), cv2.imread(self.im_files[i]))
+            ext = Path(self.im_files[i]).suffix.lower()
+            if ext == '.dng' and process_hq_dng_file is not None:
+                dng_tensor = process_hq_dng_file(self.im_files[i])
+                assert dng_tensor is not None, f'Image Not Found {self.im_files[i]}'
+                np_im = dng_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                np_im = (np_im.clip(0.0, 1.0) * 255.0).astype(np.uint8)
+                np.save(f.as_posix(), np_im[..., ::-1])  # store BGR
+            else:
+                np.save(f.as_posix(), cv2.imread(self.im_files[i]))
 
     def load_mosaic(self, index):
         # YOLOv3 4-mosaic loader. Loads 1 image + 3 random images into a 4-image mosaic
@@ -1001,17 +1023,27 @@ def verify_image_label(args):
     nm, nf, ne, nc, msg, segments = 0, 0, 0, 0, '', []  # number (missing, found, empty, corrupt), message, segments
     try:
         # verify images
-        im = Image.open(im_file)
-        im.verify()  # PIL verify
-        shape = exif_size(im)  # image size
-        assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
-        assert im.format.lower() in IMG_FORMATS, f'invalid image format {im.format}'
-        if im.format.lower() in ('jpg', 'jpeg'):
-            with open(im_file, 'rb') as f:
-                f.seek(-2, 2)
-                if f.read() != b'\xff\xd9':  # corrupt JPEG
-                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, 'JPEG', subsampling=0, quality=100)
-                    msg = f'{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved'
+        ext = Path(im_file).suffix.lower()
+        if ext == '.dng':
+            if process_hq_dng_file is None:
+                raise RuntimeError('process_hq_dng_file unavailable. Ensure PYTHONPATH includes project root and raw dependencies are installed.')
+            dng_tensor = process_hq_dng_file(im_file)
+            if dng_tensor is None:
+                raise RuntimeError(f'process_hq_dng_file returned None for {im_file}')
+            h, w = dng_tensor.shape[-2], dng_tensor.shape[-1]
+            shape = (h, w)
+        else:
+            im = Image.open(im_file)
+            im.verify()  # PIL verify
+            shape = exif_size(im)  # image size
+            assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+            assert im.format.lower() in IMG_FORMATS, f'invalid image format {im.format}'
+            if im.format.lower() in ('jpg', 'jpeg'):
+                with open(im_file, 'rb') as f:
+                    f.seek(-2, 2)
+                    if f.read() != b'\xff\xd9':  # corrupt JPEG
+                        ImageOps.exif_transpose(Image.open(im_file)).save(im_file, 'JPEG', subsampling=0, quality=100)
+                        msg = f'{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved'
 
         # verify labels
         if os.path.isfile(lb_file):

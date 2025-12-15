@@ -188,7 +188,7 @@ def run(
             filters_number = len(cfg.filters)
             z_dim = z_dim + filters_number
             num_state_dim = num_state_dim + filters_number
-            isp_model = Agent(cfg, shape=(6 + filters_number, 64, 64))
+            isp_model = Agent(cfg, shape=(6 + filters_number, 64, 64), meta_ccm=cfg.meta_ccm)
             isp_model.load_state_dict(torch.load(isp_weights)['agent_model'])
             isp_model.to(device)
             filter_name = [x.get_short_name() for x in isp_model.filters]

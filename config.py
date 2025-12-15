@@ -36,6 +36,12 @@ cfg.usm_sharpen_range = (0.0, 2.0)  # wikipedia recommended sigma 0.5-2.0; amoun
 cfg.sharpen_range = (0.0, 10.0)
 cfg.ccm_range = (-2.0, 2.0)
 cfg.denoise_range = (0.0, 1.0)
+# Camera metadata CCM baseline (rows: R, G, B)
+cfg.meta_ccm = [
+    [2.2298, -0.9633, -0.2665],
+    [-0.3463, 2.1213, -0.7749],
+    [-0.1622, -0.4427, 1.6049],
+]
 
 cfg.masking = False
 cfg.minimum_strength = 0.3

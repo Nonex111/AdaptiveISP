@@ -14,8 +14,8 @@ cattrs==23.2.3
 cffi==1.16.0
 cma==3.2.2
 colorama==0.4.6
-colour-demosaicing==0.2.5
-colour-science==0.4.4
+colour-demosaicing==0.2.2
+colour-science==0.4.1
 comm==0.2.2
 contourpy==1.2.1
 cryptography==43.0.0
