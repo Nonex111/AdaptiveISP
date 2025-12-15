@@ -248,9 +248,6 @@ class DynamicISP:
                 (feed_dict['im'], feed_dict['label'], feed_dict['path'], feed_dict['shape'], feed_dict['state']))
             z = torch.from_numpy(feed_dict['z']).to(self.device)
 
-            agent_optimizer.zero_grad()
-            value_optimizer.zero_grad()
-
             # callbacks.run('on_train_batch_start')
             imgs = imgs.to(self.device, non_blocking=True).float()  # input 0.0-1.0
 
@@ -279,34 +276,42 @@ class DynamicISP:
             # print('new_states_slice', new_states[:, STATE_REWARD_DIM:STATE_REWARD_DIM + 1])
             # print('detect_retouch_loss shape', detect_retouch_loss.shape) [N, 1]
 
+            # --- Classic actor-critic (A2C-style) ---
+            # Critic target uses bootstrapped V(s') but MUST be detached to avoid "value hacking".
+            reward_detached = reward.detach()
+            stopped_detached = stopped.detach()
+            with torch.no_grad():
+                if self.cfg.use_TD:
+                    new_value_target = self.value(retouch.detach(), new_states.detach())
+                    clear_final = torch.gt(
+                        new_states[:, STATE_STEP_DIM:STATE_STEP_DIM + 1].detach(),
+                        self.cfg.maximum_trajectory_length,
+                    ).float()
+                    new_value_target = new_value_target * (1.0 - clear_final)
+                    if self.args.use_truncated:
+                        retouch_mean = torch.mean(retouch.detach(), dim=(1, 2, 3)).unsqueeze(-1)
+                        truncated = torch.where(0.01 < retouch_mean, 1.0, 0.0)
+                        truncated = torch.where(retouch_mean < self.max_bri, truncated, torch.zeros_like(truncated))
+                        q_target = reward_detached + (1.0 - stopped_detached) * self.cfg.discount_factor * new_value_target * (1.0 - truncated)
+                    else:
+                        q_target = reward_detached + (1.0 - stopped_detached) * self.cfg.discount_factor * new_value_target
+                else:
+                    q_target = reward_detached
+
             old_value = self.value(imgs, states.to(self.device))
-            new_value = self.value(retouch, new_states)
+            advantage = q_target - old_value
+            value_loss = torch.mean(advantage ** 2)
+            policy_loss = -torch.mean(surrogate * advantage.detach())
 
-            clear_final = torch.gt(new_states[:, STATE_STEP_DIM:STATE_STEP_DIM + 1], self.cfg.maximum_trajectory_length).float()
-            new_value = new_value * (1.0 - clear_final)
-            if self.args.use_truncated:
-                retouch_mean = torch.mean(retouch, dim=(1, 2, 3)).unsqueeze(-1)
-                truncated = torch.where(0.01 < retouch_mean, 1.0, 0.0)
-                truncated = torch.where(retouch_mean < self.max_bri, truncated, torch.zeros_like(truncated))
-                q_value = reward + (1.0 - stopped) * self.cfg.discount_factor * new_value * (1.0 - truncated)
-            else:
-                q_value = reward + (1.0 - stopped) * self.cfg.discount_factor * new_value
-            advantage = q_value.detach() - old_value
-            value_loss = torch.mean(advantage ** 2)  # , dim=(0, 1)
-
-            # TD learning
-            if self.cfg.use_TD:
-                routine_loss = -q_value * self.cfg.parameter_lr_mul
-                advantage = -advantage
-            else:
-                routine_loss = -reward
-                advantage = -reward
-            assert len(routine_loss.shape) == len(surrogate.shape)
-            agent_loss = torch.mean(routine_loss + surrogate * advantage.detach())
+            # Train ISP parameter regressors via differentiable task loss (keeps policy update "classic").
+            param_loss = torch.mean(detect_retouch_loss) * float(self.cfg.parameter_lr_mul)
+            agent_loss = policy_loss + param_loss
 
             if iter % self.cfg.summary_freq == 0:
                 try:
                     self.writer.add_scalar('agent_loss', agent_loss, global_step=iter)
+                    self.writer.add_scalar('policy_loss', policy_loss, global_step=iter)
+                    self.writer.add_scalar('param_loss', param_loss, global_step=iter)
                     self.writer.add_scalar('value_loss', value_loss, global_step=iter)
                     self.writer.add_scalar('detect_loss', detect_retouch_loss.mean(), global_step=iter)
                     self.writer.add_images('input', torch.clip(imgs[:self.cfg.show_img_num, ...], 0.0, 1.0), global_step=iter, dataformats="NCHW")
@@ -337,18 +342,18 @@ class DynamicISP:
                     print("write log error!")
                 # print(old_value, new_value)
 
-            # Backward
-            value_loss.backward(retain_graph=False)
-            agent_loss.backward(retain_graph=False)
-
-            # clip gradient
-            torch.nn.utils.clip_grad_norm(self.agent.parameters(), 1.0)
+            # Backward (separate critic/actor updates to avoid accidental gradient mixing)
+            value_optimizer.zero_grad()
+            value_loss.backward()
             torch.nn.utils.clip_grad_norm(self.value.parameters(), 1.0)
-
-            agent_optimizer.step()
             value_optimizer.step()
-            agent_scheduler.step()
             value_scheduler.step()
+
+            agent_optimizer.zero_grad()
+            agent_loss.backward()
+            torch.nn.utils.clip_grad_norm(self.agent.parameters(), 1.0)
+            agent_optimizer.step()
+            agent_scheduler.step()
 
             mloss_agent = (mloss_agent * iter + agent_loss.item()) / (iter + 1)  # update mean losses
             mloss_value = (mloss_value * iter + value_loss.item()) / (iter + 1)  # update mean losses
