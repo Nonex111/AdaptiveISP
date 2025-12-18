@@ -290,9 +290,14 @@ class DynamicISP:
                     new_value_target = new_value_target * (1.0 - clear_final)
                     if self.args.use_truncated:
                         retouch_mean = torch.mean(retouch.detach(), dim=(1, 2, 3)).unsqueeze(-1)
-                        truncated = torch.where(0.01 < retouch_mean, 1.0, 0.0)
-                        truncated = torch.where(retouch_mean < self.max_bri, truncated, torch.zeros_like(truncated))
-                        q_target = reward_detached + (1.0 - stopped_detached) * self.cfg.discount_factor * new_value_target * (1.0 - truncated)
+                        # Treat invalid retouch (too dark/bright or NaN/Inf) as terminal: don't bootstrap V(s').
+                        truncated = (
+                            (retouch_mean < 0.01)
+                            | (retouch_mean > self.max_bri)
+                            | (~torch.isfinite(retouch_mean))
+                        )
+                        bootstrap_mask = (1.0 - stopped_detached) * (1.0 - truncated.float())
+                        q_target = reward_detached + bootstrap_mask * self.cfg.discount_factor * new_value_target
                     else:
                         q_target = reward_detached + (1.0 - stopped_detached) * self.cfg.discount_factor * new_value_target
                 else:
