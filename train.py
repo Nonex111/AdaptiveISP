@@ -91,6 +91,8 @@ class DynamicISP:
         self.device = torch.device('cuda')
         cfg.filter_runtime_penalty = args.runtime_penalty
         cfg.filter_runtime_penalty_lambda = args.runtime_penalty_lambda
+        if getattr(args, "masking", None) is not None:
+            cfg.masking = args.masking
 
         # Hyperparameters
         hyp = args.hyp
@@ -258,17 +260,34 @@ class DynamicISP:
 
             pred_input = self.yolo_model(imgs)
             # detect_input_loss, detect_input_loss_items = compute_loss(pred_input, targets.to(self.device))  # loss scaled by batch_size
-            detect_input_loss, _ = self.compute_loss_batch(compute_loss_batch, pred_input, feed_dict['label'], self.device)
-            detect_input_loss = torch.clip(detect_input_loss * self.cfg.detect_loss_weight, 0, 1.0)
+            detect_input_loss_raw, _ = self.compute_loss_batch(compute_loss_batch, pred_input, feed_dict['label'], self.device)
+            detect_input_loss = torch.clip(detect_input_loss_raw * self.cfg.detect_loss_weight, 0, 1.0)
 
             pred_retouch = self.yolo_model(retouch)
             # detect_retouch_loss, detect_retouch_loss_items = compute_loss(pred_retouch, targets.to(self.device))  # loss scaled by batch_size
             _, detect_retouch_loss_items = compute_loss(pred_retouch, targets.to(self.device))  # loss scaled by batch_size
-            detect_retouch_loss, _ = self.compute_loss_batch(compute_loss_batch, pred_retouch, feed_dict['label'], self.device)  # loss scaled by batch_size
-            detect_retouch_loss = torch.clip(detect_retouch_loss * self.cfg.detect_loss_weight, 0, 1.0)
+            detect_retouch_loss_raw, _ = self.compute_loss_batch(compute_loss_batch, pred_retouch, feed_dict['label'], self.device)  # loss scaled by batch_size
+            detect_retouch_loss = torch.clip(detect_retouch_loss_raw * self.cfg.detect_loss_weight, 0, 1.0)
+
+            input_mean = torch.mean(imgs.detach(), dim=(1, 2, 3)).unsqueeze(-1)  # [B, 1]
+            retouch_mean = torch.mean(retouch.detach(), dim=(1, 2, 3)).unsqueeze(-1)  # [B, 1]
+            retouch_nonfinite = ~torch.isfinite(retouch_mean)
+            dark_threshold = retouch_mean.new_tensor(float(self.args.retouch_dark_abs))
+            if self.args.relative_brightness:
+                dark_threshold = torch.minimum(dark_threshold, input_mean * float(self.args.retouch_dark_ratio))
+            retouch_too_dark = retouch_mean < dark_threshold
+            retouch_too_bright = retouch_mean > self.max_bri
+            retouch_invalid = retouch_nonfinite | retouch_too_dark | retouch_too_bright
+
+            if self.args.normalize_reward:
+                reward_input = detect_input_loss_raw.detach() * self.cfg.detect_loss_weight
+                reward_retouch = detect_retouch_loss_raw.detach() * self.cfg.detect_loss_weight
+                reward_delta = (reward_input - reward_retouch) / (reward_input.abs() + float(self.args.reward_norm_eps))
+            else:
+                reward_delta = detect_input_loss.detach() - detect_retouch_loss
 
             reward = (self.cfg.all_reward + (1 - self.cfg.all_reward) * stopped) * \
-                     (detect_input_loss.detach() - detect_retouch_loss) * self.cfg.critic_logit_multiplier
+                     reward_delta * self.cfg.critic_logit_multiplier
             # print("reward.shape", reward.shape, detect_input_loss.shape, detect_retouch_loss.shape)
             if self.cfg.use_penalty:
                 reward -= penalty
@@ -289,13 +308,8 @@ class DynamicISP:
                     ).float()
                     new_value_target = new_value_target * (1.0 - clear_final)
                     if self.args.use_truncated:
-                        retouch_mean = torch.mean(retouch.detach(), dim=(1, 2, 3)).unsqueeze(-1)
                         # Treat invalid retouch (too dark/bright or NaN/Inf) as terminal: don't bootstrap V(s').
-                        truncated = (
-                            (retouch_mean < 0.01)
-                            | (retouch_mean > self.max_bri)
-                            | (~torch.isfinite(retouch_mean))
-                        )
+                        truncated = retouch_invalid.detach()
                         bootstrap_mask = (1.0 - stopped_detached) * (1.0 - truncated.float())
                         q_target = reward_detached + bootstrap_mask * self.cfg.discount_factor * new_value_target
                     else:
@@ -306,7 +320,12 @@ class DynamicISP:
             old_value = self.value(imgs, states.to(self.device))
             advantage = q_target - old_value
             value_loss = torch.mean(advantage ** 2)
-            policy_loss = -torch.mean(surrogate * advantage.detach())
+            policy_advantage = advantage.detach()
+            if self.args.normalize_advantage:
+                policy_advantage = (policy_advantage - policy_advantage.mean()) / (
+                    policy_advantage.std(unbiased=False) + float(self.args.adv_norm_eps)
+                )
+            policy_loss = -torch.mean(surrogate * policy_advantage)
 
             # Train ISP parameter regressors via differentiable task loss (keeps policy update "classic").
             param_loss = torch.mean(detect_retouch_loss) * float(self.cfg.parameter_lr_mul)
@@ -319,6 +338,39 @@ class DynamicISP:
                     self.writer.add_scalar('param_loss', param_loss, global_step=iter)
                     self.writer.add_scalar('value_loss', value_loss, global_step=iter)
                     self.writer.add_scalar('detect_loss', detect_retouch_loss.mean(), global_step=iter)
+                    self.writer.add_scalar('detect_input_loss_raw', detect_input_loss_raw.mean(), global_step=iter)
+                    self.writer.add_scalar('detect_retouch_loss_raw', detect_retouch_loss_raw.mean(), global_step=iter)
+
+                    self.writer.add_scalar('reward/mean', reward_detached.mean(), global_step=iter)
+                    self.writer.add_scalar('reward/std', reward_detached.std(unbiased=False), global_step=iter)
+                    self.writer.add_scalar('penalty/mean', penalty.detach().mean(), global_step=iter)
+                    self.writer.add_scalar('surrogate/mean', surrogate.detach().mean(), global_step=iter)
+                    self.writer.add_scalar('advantage/mean', advantage.detach().mean(), global_step=iter)
+                    self.writer.add_scalar('advantage/std', advantage.detach().std(unbiased=False), global_step=iter)
+                    self.writer.add_scalar('value/old_mean', old_value.detach().mean(), global_step=iter)
+                    if self.cfg.use_TD:
+                        self.writer.add_scalar('value/new_target_mean', new_value_target.detach().mean(), global_step=iter)
+
+                    self.writer.add_scalar('input/mean', input_mean.mean(), global_step=iter)
+                    self.writer.add_scalar('retouch/dark_threshold_mean', dark_threshold.mean(), global_step=iter)
+                    self.writer.add_scalar('retouch/mean', retouch_mean.mean(), global_step=iter)
+                    self.writer.add_scalar('retouch/mean_min', retouch_mean.min(), global_step=iter)
+                    self.writer.add_scalar('retouch/mean_max', retouch_mean.max(), global_step=iter)
+                    self.writer.add_scalar('retouch/too_dark_ratio', retouch_too_dark.float().mean(), global_step=iter)
+                    self.writer.add_scalar('retouch/too_bright_ratio', retouch_too_bright.float().mean(), global_step=iter)
+                    self.writer.add_scalar('retouch/nonfinite_ratio', retouch_nonfinite.float().mean(), global_step=iter)
+                    self.writer.add_scalar('retouch/invalid_ratio', retouch_invalid.float().mean(), global_step=iter)
+                    self.writer.add_histogram('retouch/mean_hist', retouch_mean.detach().cpu().squeeze(-1), global_step=iter)
+
+                    selected_filter = agent_debug_out.get('selected_filter', None)
+                    if selected_filter is not None:
+                        selected_filter = selected_filter.detach().to(torch.int64)
+                        counts = torch.bincount(selected_filter, minlength=len(self.filter_name)).float()
+                        total = max(int(selected_filter.numel()), 1)
+                        for i, name in enumerate(self.filter_name):
+                            self.writer.add_scalar(f'filter_select/{name}', (counts[i] / total).item(), global_step=iter)
+                        self.writer.add_histogram('filter_select/id', selected_filter.detach().cpu(), global_step=iter)
+
                     self.writer.add_images('input', torch.clip(imgs[:self.cfg.show_img_num, ...], 0.0, 1.0), global_step=iter, dataformats="NCHW")
                     # self.writer.add_images('retouch', torch.clip(retouch[:self.cfg.show_img_num, ...], 0.0, 1.0), global_step=iter, dataformats="NCHW")
                 except Exception as e:
@@ -350,13 +402,17 @@ class DynamicISP:
             # Backward (separate critic/actor updates to avoid accidental gradient mixing)
             value_optimizer.zero_grad()
             value_loss.backward()
-            torch.nn.utils.clip_grad_norm(self.value.parameters(), 1.0)
+            value_grad_norm = torch.nn.utils.clip_grad_norm_(self.value.parameters(), 1.0)
+            if iter % self.cfg.summary_freq == 0:
+                self.writer.add_scalar('grad_norm/value', float(value_grad_norm), global_step=iter)
             value_optimizer.step()
             value_scheduler.step()
 
             agent_optimizer.zero_grad()
             agent_loss.backward()
-            torch.nn.utils.clip_grad_norm(self.agent.parameters(), 1.0)
+            agent_grad_norm = torch.nn.utils.clip_grad_norm_(self.agent.parameters(), 1.0)
+            if iter % self.cfg.summary_freq == 0:
+                self.writer.add_scalar('grad_norm/agent', float(agent_grad_norm), global_step=iter)
             agent_optimizer.step()
             agent_scheduler.step()
 
@@ -381,8 +437,23 @@ class DynamicISP:
             # callbacks.run('on_train_batch_end', self.a, ni, imgs, targets, paths, list(mloss))
 
             # update data pool
-            if torch.isnan(retouch).any() or torch.isinf(retouch).any() or torch.mean(retouch) < 0.01 or torch.mean(retouch) > self.max_bri:
-                print("retouch is nan or inf", torch.mean(retouch).detach().cpu().numpy())
+            fill_pool_triggered = bool((
+                torch.isnan(retouch).any()
+                | torch.isinf(retouch).any()
+                | retouch_invalid.any()
+            ).item())
+            if iter % self.cfg.summary_freq == 0:
+                self.writer.add_scalar('replay/fill_pool_triggered', float(fill_pool_triggered), global_step=iter)
+
+            if fill_pool_triggered:
+                print(
+                    "retouch invalid -> refill replay",
+                    f"retouch_mean={float(retouch_mean.mean().detach().cpu()):.6f}",
+                    f"dark_thr={float(dark_threshold.mean().detach().cpu()):.6f}",
+                    f"too_dark_ratio={float(retouch_too_dark.float().mean().detach().cpu()):.3f}",
+                    f"too_bright_ratio={float(retouch_too_bright.float().mean().detach().cpu()):.3f}",
+                    f"nonfinite_ratio={float(retouch_nonfinite.float().mean().detach().cpu()):.3f}",
+                )
                 self.train_loader.fill_pool()
             else:
                 self.train_loader.replace_memory(
@@ -524,7 +595,8 @@ class DynamicISP:
         if self.args.data_name in ("lod", ):
             self.val_loader, _ = create_dataloader_real_hr(self.val_path, self.args.imgsz, batch_size, self.gs, False,
                                                            hyp=self.hyp, cache=False, rect=False, workers=1, pad=0.0,
-                                                           prefix=colorstr('val: '), add_noise=self.args.add_noise)
+                                                           prefix=colorstr('val: '), add_noise=self.args.add_noise,
+                                                           hr_original=self.args.hr_original)
         s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
         pbar = tqdm(self.val_loader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
         for batch_i, (imgs, targets, paths, shapes, imgs_hr) in enumerate(pbar):
@@ -624,6 +696,21 @@ class DynamicISP:
 if __name__ == "__main__":
     import argparse
 
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return True
+        val = str(v).strip().lower()
+        if val in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if val in ("0", "false", "f", "no", "n", "off"):
+            return False
+        raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
+
+    def add_bool_flag(parser, name, default, help):
+        parser.add_argument(name, type=str2bool, nargs='?', const=True, default=default, help=help)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default='train_val', help="train, train and val, val")
     parser.add_argument("--batch_size", type=int, default=2, help="batch size")
@@ -633,6 +720,8 @@ if __name__ == "__main__":
     parser.add_argument("--scheduler_step_size", type=int, default=20, help="scheduler_step_size")
     parser.add_argument("--scheduler_lr_gamma", type=float, default=0.5, help="scheduler_lr_gamma")
     parser.add_argument("--imgsz", type=int, default=512, help="image size")
+    parser.add_argument("--hr_original", action="store_true", default=False,
+                        help="in val(), run ISP high_res branch on original-resolution images for saving")
     parser.add_argument("--workers", type=int, default=4, help="workers")
     
     parser.add_argument('--weights', type=str, default='../../pretrained/yolov3.pt', help='yolov3 pretrained path')
@@ -642,12 +731,20 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", type=str, default='adaptiveisp', help="save path at experiments/save_path/")
     parser.add_argument("--data_name", type=str, default='lod', choices=['lod', ], help="train data: lod")
     parser.add_argument('--data_cfg', type=str, default='data/lod.yaml', help='dataset.yaml path (relative to yolov3)')
-    parser.add_argument("--add_noise", type=bool, default=False, help="add_noise")
+    add_bool_flag(parser, "--add_noise", default=False, help="add_noise")
     parser.add_argument("--use_linear", action='store_true', default=False, help="use linear noise distribution")
     parser.add_argument("--bri_range", type=float, default=None, nargs='*', help="brightness range, (low, high), 0.0~1.0")
     parser.add_argument("--noise_level", type=float, default=None, help="noise_level, 0.001~0.012")
 
-    parser.add_argument('--use_truncated', type=bool, default=True, help='use_truncated')
+    add_bool_flag(parser, "--use_truncated", default=True, help="use_truncated")
+    add_bool_flag(parser, "--masking", default=None, help="enable per-operator masking (also affects mask visualization)")
+    add_bool_flag(parser, "--relative_brightness", default=False, help="use relative (input-conditioned) dark threshold for invalid retouch")
+    parser.add_argument("--retouch_dark_ratio", type=float, default=0.2, help="relative dark threshold: min(abs, input_mean * ratio)")
+    parser.add_argument("--retouch_dark_abs", type=float, default=0.01, help="absolute cap for retouch dark threshold")
+    add_bool_flag(parser, "--normalize_reward", default=False, help="normalize reward by input detection loss magnitude")
+    parser.add_argument("--reward_norm_eps", type=float, default=1e-6, help="epsilon for reward normalization")
+    add_bool_flag(parser, "--normalize_advantage", default=False, help="standardize advantage for policy loss")
+    parser.add_argument("--adv_norm_eps", type=float, default=1e-6, help="epsilon for advantage standardization")
     parser.add_argument("--runtime_penalty", action='store_true', default=False, help="use runtime penalty")
     parser.add_argument("--runtime_penalty_lambda", type=float, default=0.01, help="use runtime penalty lambda")
     parser.add_argument('--resume', type=str, default=None, help='resume model weights')

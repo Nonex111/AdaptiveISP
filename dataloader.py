@@ -378,7 +378,8 @@ def create_dataloader_real_hr(path,
             pad=pad,
             image_weights=image_weights,
             prefix=prefix,
-            limit=limit)
+            limit=limit,
+            **kwargs)
 
     batch_size = min(batch_size, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
@@ -416,4 +417,3 @@ def get_initial_states(batch_size, num_state_dim, filters_number):
             # Initially nothing has been used
             states[k, -(i + 1)] = 0
     return states
-

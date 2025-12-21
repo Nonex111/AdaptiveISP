@@ -159,7 +159,8 @@ class Filter(torch.nn.Module):
         return output
 
     def use_masking(self):
-        return False
+        # Controlled by config/CLI; default off for backward compatibility.
+        return bool(getattr(self.cfg, "masking", False))
 
     def get_num_mask_parameters(self):
         return 6

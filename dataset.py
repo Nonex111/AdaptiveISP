@@ -797,15 +797,33 @@ class LoadImagesAndLabelsNormalizeHR(LoadImagesAndLabels):
                  pad=0.0,
                  min_items=0,
                  prefix='',
-                 limit=-1):
+                 limit=-1,
+                 hr_original=False):
         super(LoadImagesAndLabelsNormalizeHR, self).__init__(path, img_size, batch_size, augment, hyp, rect, image_weights,
                                                            cache_images, single_cls, stride, pad, min_items, prefix, limit)
+        self.hr_original = hr_original
+
+    def _load_original_image(self, index):
+        f = self.im_files[index]
+        ext = Path(f).suffix.lower()
+        if ext == '.dng':
+            raw = process_hq_dng_file(f, output_channels=3)
+            if raw is None:
+                raise FileNotFoundError(f'Image Not Found {f}')
+            # CHW RGB float32 0-1
+            return raw.squeeze(0).cpu().numpy().astype(np.float32)
+        img0 = cv2.imread(f)  # BGR uint8
+        if img0 is None:
+            raise FileNotFoundError(f'Image Not Found {f}')
+        img0 = img0.transpose((2, 0, 1))[::-1]  # CHW RGB
+        return (img0.astype(np.float32) / 255.0)
 
     def __getitem__(self, index):
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp['mosaic']
+        use_hr_original = self.hr_original and not mosaic
         if mosaic:
             # Load mosaic
             img, labels = self.load_mosaic(index)
@@ -814,11 +832,12 @@ class LoadImagesAndLabelsNormalizeHR(LoadImagesAndLabels):
             # MixUp augmentation
             if random.random() < hyp['mixup']:
                 img, labels = mixup(img, labels, *self.load_mosaic(random.randint(0, self.n - 1)))
+            img_hr = img.copy()
 
         else:
             # Load image
             img, (h0, w0), (h, w) = self.load_image(index)
-            img_hr = img.copy()
+            img_hr = self._load_original_image(index) if use_hr_original else img.copy()
 
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
@@ -874,8 +893,12 @@ class LoadImagesAndLabelsNormalizeHR(LoadImagesAndLabels):
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img) / 255.
 
-        img_hr = img_hr.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img_hr = np.ascontiguousarray(img_hr) / 255.
+        if use_hr_original:
+            # already CHW RGB float32 0-1 from _load_original_image()
+            img_hr = np.ascontiguousarray(img_hr)
+        else:
+            img_hr = img_hr.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+            img_hr = np.ascontiguousarray(img_hr) / 255.
 
         return torch.from_numpy(img), labels_out, self.im_files[index], shapes, torch.from_numpy(img_hr)
     
