@@ -7,6 +7,7 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 import importlib
+import math
 
 import numpy as np
 import torch
@@ -36,7 +37,14 @@ from util import STATE_DROPOUT_BEGIN, STATE_REWARD_DIM, STATE_STEP_DIM, STATE_ST
 from agent import Agent
 from value import Value
 # from config import cfg
-from dataloader import get_noise, get_initial_states, create_dataloader_real_hr
+from dataloader import (
+    get_noise,
+    get_initial_states,
+    create_dataloader_real_hr,
+    create_dataloader,
+    create_dataloader_real,
+)
+from isp.fixed_pipeline import FixedISPPipeline
 
 
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
@@ -93,6 +101,76 @@ class DynamicISP:
         cfg.filter_runtime_penalty_lambda = args.runtime_penalty_lambda
         if getattr(args, "masking", None) is not None:
             cfg.masking = args.masking
+        if getattr(args, "ifcnn_weights", None) is not None:
+            cfg.ifcnn_weights = args.ifcnn_weights
+        if getattr(args, "ifcnn_trainable", None) is not None:
+            cfg.ifcnn_trainable = args.ifcnn_trainable
+        if getattr(args, "ifcnn_fuse_scheme", None) is not None:
+            cfg.ifcnn_fuse_scheme = int(args.ifcnn_fuse_scheme)
+        if getattr(args, "force_filter_name", None) is not None:
+            cfg.force_filter_name = args.force_filter_name
+        if getattr(args, "force_filter_step", None) is not None:
+            cfg.force_filter_step = args.force_filter_step if int(args.force_filter_step) >= 0 else None
+
+        # Optional constraints for NLM strength (kept off by default to preserve original behavior).
+        try:
+            nlm_limit = float(getattr(args, "nlm_limit", -1.0))
+        except Exception:
+            nlm_limit = -1.0
+        cfg.nlm_limit = float(nlm_limit) if nlm_limit >= 0 else None
+        try:
+            nlm_init = float(getattr(args, "nlm_init", -1.0))
+        except Exception:
+            nlm_init = -1.0
+        cfg.nlm_init = nlm_init if nlm_init > 0 else None
+
+        # --- ISP mode tweaks (reuse RL code path) ---
+        isp_mode = getattr(args, "isp_mode", "rl")
+        if isp_mode == "fixed_postprocess":
+            # 1) Fix WB/CCM upstream (camera metadata), so remove them from the RL action space.
+            remove_filter_names = {"CCMFilter", "ImprovedWhiteBalanceFilter"}
+            orig_filters = list(getattr(cfg, "filters", []))
+            orig_runtime = list(getattr(cfg, "filters_runtime", []))
+            new_filters = []
+            new_runtime = []
+            runtime_aligned = len(orig_runtime) == len(orig_filters)
+            for i, f in enumerate(orig_filters):
+                if getattr(f, "__name__", "") in remove_filter_names:
+                    continue
+                new_filters.append(f)
+                if runtime_aligned:
+                    new_runtime.append(orig_runtime[i])
+            cfg.filters = new_filters
+            if hasattr(cfg, "filters_runtime"):
+                cfg.filters_runtime = new_runtime if runtime_aligned else [0.0 for _ in new_filters]
+
+            # 2) Optionally force denoise first (learnable params), then run an RL-chosen post pipeline.
+            # If disabled, fixed_postprocess becomes "RL postprocess" with a reduced action space (no WB/CCM),
+            # and --steps is interpreted as the total number of RL steps (same as rl mode).
+            force_nlm_first = bool(getattr(args, "force_nlm_first_in_fixed_postprocess_mode", True))
+
+            post_steps = int(getattr(args, "steps", getattr(cfg, "test_steps", 5)))
+            cfg.test_steps = post_steps + 1 if force_nlm_first else post_steps
+            if getattr(cfg, "maximum_trajectory_length", 0) < cfg.test_steps:
+                cfg.maximum_trajectory_length = cfg.test_steps
+
+            # Optionally force Gamma as the last step (typical ISP order: ... -> gamma).
+            force_schedule = {0: "NLM"} if force_nlm_first else {}
+            if getattr(args, "fixed_postprocess_force_gamma", True):
+                force_schedule[int(cfg.test_steps) - 1] = "G"
+                gamma_init = float(getattr(args, "gamma_init", 2.2))
+                if gamma_init > 0:
+                    cfg.gamma_init = gamma_init
+            if force_schedule:
+                cfg.force_filter_schedule = force_schedule
+
+            # If we force NLM at step 0, disallow selecting it later to keep the "postprocess-only" steps clean.
+            if force_nlm_first:
+                cfg.disallow_filter_short_names_after_step0 = ["NLM"]
+
+            # Update dependent dims after filter list change.
+            cfg.num_state_dim = 3 + len(cfg.filters)
+            cfg.z_dim = 3 + len(cfg.filters) * int(getattr(cfg, "z_dim_per_filter", 16))
 
         # Hyperparameters
         hyp = args.hyp
@@ -129,13 +207,21 @@ class DynamicISP:
                                             single_cls=False, hyp=hyp, augment=False, cache=False, pad=0.0,
                                             rect=False, image_weights=False, prefix=colorstr('train: '), limit=-1,
                                             add_noise=args.add_noise, data_name=args.data_name, brightness_range=args.bri_range, 
-                                            noise_level=args.noise_level, use_linear=args.use_linear)
+                                            noise_level=args.noise_level, use_linear=args.use_linear,
+                                            vi_dir_name=getattr(args, "vi_dir_name", "vi"),
+                                            ir_dir_name=getattr(args, "ir_dir_name", "ir"),
+                                            ir_root=getattr(args, "ir_root", None),
+                                            apply_meta_wb_ccm=getattr(args, "apply_meta_wb_ccm", False))
         if val:
             self.val_loader = ReplayMemory(cfg, val, val_path, args.imgsz, args.batch_size, gs,
                                            single_cls=False, hyp=hyp, augment=False, cache=False, pad=0.0,
                                            rect=False, image_weights=False, prefix=colorstr('val: '), limit=-1,
                                            add_noise=args.add_noise, data_name=args.data_name, brightness_range=args.bri_range,
-                                           noise_level=args.noise_level, use_linear=args.use_linear)
+                                           noise_level=args.noise_level, use_linear=args.use_linear,
+                                           vi_dir_name=getattr(args, "vi_dir_name", "vi"),
+                                           ir_dir_name=getattr(args, "ir_dir_name", "ir"),
+                                           ir_root=getattr(args, "ir_root", None),
+                                           apply_meta_wb_ccm=getattr(args, "apply_meta_wb_ccm", False))
             self.val_loader = self.val_loader.get_feed_dict_and_states(8)
         # Model attributes
         # check_anchors(dataset, model=yolo_model, thr=hyp['anchor_t'], imgsz=args.imgsz)  # run AutoAnchor
@@ -151,6 +237,12 @@ class DynamicISP:
         yolo_model = yolo_model.to(self.device)
         self.yolo_model = yolo_model
         self.data_dict = data_dict
+
+        # Ensure optional cfg keys exist to avoid Dict.__getattr__ KeyError.
+        if "force_filter_schedule" not in cfg:
+            cfg.force_filter_schedule = None
+        if "disallow_filter_short_names_after_step0" not in cfg:
+            cfg.disallow_filter_short_names_after_step0 = None
 
         self.agent = Agent(cfg, shape=(6 + len(cfg.filters), 64, 64), meta_ccm=cfg.meta_ccm).to(self.device)
         self.value = Value(cfg, shape=(9 + len(cfg.filters), 64, 64)).to(self.device)
@@ -248,13 +340,21 @@ class DynamicISP:
             # "im", "label", "path", "shape", "state", "z": numpy
             imgs, targets, paths, shapes, states = create_input_tensor(
                 (feed_dict['im'], feed_dict['label'], feed_dict['path'], feed_dict['shape'], feed_dict['state']))
+            extra = None
+            ir_imgs = None
+            if isinstance(imgs, (tuple, list)) and len(imgs) == 2:
+                imgs, ir_imgs = imgs
             z = torch.from_numpy(feed_dict['z']).to(self.device)
 
             # callbacks.run('on_train_batch_start')
             imgs = imgs.to(self.device, non_blocking=True).float()  # input 0.0-1.0
+            states = states.to(self.device)
+            if ir_imgs is not None:
+                ir_imgs = ir_imgs.to(self.device, non_blocking=True).float()
+                extra = {"ir": ir_imgs}
 
             # Forward
-            agent_out, agent_debug_out, agent_debugger = self.agent((imgs, z, states.to(self.device)), progress)
+            agent_out, agent_debug_out, agent_debugger = self.agent((imgs, z, states, extra), progress)
             retouch, new_states, surrogate, penalty = agent_out
             stopped = new_states[:, STATE_STOPPED_DIM:STATE_STOPPED_DIM + 1]
 
@@ -317,7 +417,7 @@ class DynamicISP:
                 else:
                     q_target = reward_detached
 
-            old_value = self.value(imgs, states.to(self.device))
+            old_value = self.value(imgs, states)
             advantage = q_target - old_value
             value_loss = torch.mean(advantage ** 2)
             policy_advantage = advantage.detach()
@@ -456,10 +556,13 @@ class DynamicISP:
                 )
                 self.train_loader.fill_pool()
             else:
+                ir_np = None
+                if ir_imgs is not None:
+                    ir_np = ir_imgs.detach().cpu().numpy()
                 self.train_loader.replace_memory(
                     self.train_loader.images_and_states_to_records(
                         retouch.detach().cpu().numpy(), feed_dict['label'], feed_dict['path'], feed_dict['shape'],
-                        new_states.detach().cpu().numpy()))
+                        new_states.detach().cpu().numpy(), ir_images=ir_np))
             # validate
             if iter % self.cfg.val_freq == 0:
                 self.agent.eval()
@@ -468,6 +571,9 @@ class DynamicISP:
                 # "im", "label", "path", "shape", "state", "z": numpy
                 imgs, targets, paths, shapes, states = create_input_tensor(
                     (feed_dict['im'], feed_dict['label'], feed_dict['path'], feed_dict['shape'], feed_dict['state']))
+                ir_imgs_val = None
+                if isinstance(imgs, (tuple, list)) and len(imgs) == 2:
+                    imgs, ir_imgs_val = imgs
                 for b in range(imgs.shape[0]):
                     masks = []
                     decisions = []
@@ -475,11 +581,16 @@ class DynamicISP:
                     debug_info_list = []
                     retouch_img_trajs = []
                     retouch = imgs[b].unsqueeze(0).to(self.device)
+                    extra_val = None
+                    if ir_imgs_val is not None:
+                        extra_val = {"ir": ir_imgs_val[b].unsqueeze(0).to(self.device)}
                     retouch_img_trajs.append(np.transpose(retouch[0].detach().cpu().numpy(), (1, 2, 0)))
                     noises = torch.from_numpy(np.array([self.train_loader.get_noise(1) for _ in range(self.cfg.test_steps)])).to(self.device)
                     states = torch.from_numpy(self.train_loader.get_initial_states(1)).to(self.device)
                     for i in range(self.cfg.test_steps):
-                        (retouch, new_states, _, _), debug_info, generator_debugger = self.agent((retouch.float(), noises[i], states), 1.0)
+                        (retouch, new_states, _, _), debug_info, generator_debugger = self.agent(
+                            (retouch.float(), noises[i], states, extra_val), 1.0
+                        )
                         retouch_img_trajs.append(np.transpose(retouch[0].detach().cpu().numpy(), (1, 2, 0)))
                         states = new_states
 
@@ -568,6 +679,10 @@ class DynamicISP:
         torch.cuda.empty_cache()
 
     def val(self, batch_size=1, model_weights=None, steps=5):
+        # For fixed_postprocess, CLI --steps means "post" steps (excluding the forced denoise-first).
+        if getattr(self.args, "isp_mode", "rl") == "fixed_postprocess":
+            steps = int(steps) + 1
+
         z_type = "uniform"
         z_dim = 16 + 3 + len(self.cfg.filters)
         filters_number = len(self.cfg.filters)
@@ -596,7 +711,8 @@ class DynamicISP:
             self.val_loader, _ = create_dataloader_real_hr(self.val_path, self.args.imgsz, batch_size, self.gs, False,
                                                            hyp=self.hyp, cache=False, rect=False, workers=1, pad=0.0,
                                                            prefix=colorstr('val: '), add_noise=self.args.add_noise,
-                                                           hr_original=self.args.hr_original)
+                                                           hr_original=self.args.hr_original,
+                                                           apply_meta_wb_ccm=getattr(self.args, "apply_meta_wb_ccm", False))
         s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
         pbar = tqdm(self.val_loader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
         for batch_i, (imgs, targets, paths, shapes, imgs_hr) in enumerate(pbar):
@@ -692,6 +808,213 @@ class DynamicISP:
             #                 names)  # pred
         torch.cuda.empty_cache()
 
+
+def _fixed_filter_cls(name: str):
+    from isp.filters import ToneFilter, ContrastFilter, SharpenFilter, SaturationPlusFilter, ExposureFilter
+
+    key = (name or "").strip().lower()
+    mapping = {
+        "tone": ToneFilter,
+        "contrast": ContrastFilter,
+        "sharpen": SharpenFilter,
+        "saturation": SaturationPlusFilter,
+        "exposure": ExposureFilter,
+    }
+    if key not in mapping:
+        raise ValueError(f"Unsupported --fixed_learn_filter={name!r}, choose from {sorted(mapping.keys())}")
+    return mapping[key]
+
+
+def run_fixed_isp(args):
+    """Deterministic ISP training: fixed WB/CCM upstream + learn denoise + one module + gamma(last)."""
+    try:
+        cfg = importlib.import_module(f'{args.cfg}').cfg
+    except Exception as e:
+        raise RuntimeError(f"Failed to import cfg module {args.cfg!r}: {e}")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    base_dir = os.path.join('experiments', args.save_path + '-fixedisp')
+    os.makedirs(base_dir, exist_ok=True)
+    log_dir = os.path.join(base_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    ckpt_dir = os.path.join(base_dir, "ckpt")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    Tee(os.path.join(log_dir, 'log.txt'))
+    writer = SummaryWriter(log_dir)
+    LOGGER.info(f"[fixed] outputs: {base_dir}")
+    LOGGER.info(f"[fixed] logs: {log_dir}")
+    LOGGER.info(f"[fixed] ckpt: {ckpt_dir}")
+    LOGGER.info("[fixed] note: fixed mode does not save preview images by default; use --fixed_debug_dump true if needed.")
+
+    hyp = args.hyp
+    if isinstance(hyp, str):
+        with open(hyp, errors='ignore') as f:
+            hyp = yaml.safe_load(f)  # load hyps dict
+    LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
+
+    data_dict = check_dataset(args.data_cfg)
+    nc = int(data_dict['nc'])  # number of classes
+    train_path = data_dict['train']
+
+    # Load Pretrained YOLO
+    with torch_distributed_zero_first(LOCAL_RANK):
+        weights = attempt_download(args.weights)  # download if not found locally
+    ckpt = torch.load(weights, map_location='cpu')
+    yolo_model = Model(args.yolo_cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)
+    exclude = ['anchor'] if (args.yolo_cfg or hyp.get('anchors')) else []
+    csd = ckpt['model'].float().state_dict()
+    csd = intersect_dicts(csd, yolo_model.state_dict(), exclude=exclude)
+    yolo_model.load_state_dict(csd, strict=False)
+    LOGGER.info(f'Transferred {len(csd)}/{len(yolo_model.state_dict())} items from {weights}')
+
+    # Match DynamicISP attribute wiring expected by ComputeLoss()
+    nl = yolo_model.model[-1].nl  # number of detection layers (to scale hyps)
+    hyp['box'] *= 3 / nl
+    hyp['cls'] *= nc / 80 * 3 / nl
+    hyp['obj'] *= (args.imgsz / 640) ** 2 * 3 / nl
+    hyp['label_smoothing'] = 0.0
+    yolo_model.nc = nc
+    yolo_model.hyp = hyp
+    yolo_model.names = data_dict['names']
+
+    # Freeze YOLO
+    yolo_model.train()
+    for p in yolo_model.parameters():
+        p.requires_grad = False
+    for m in yolo_model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+
+    gs = max(int(yolo_model.stride.max()), 32)
+    args.imgsz = check_img_size(args.imgsz, gs, floor=gs * 2)
+
+    if args.fixed_input == "srgb":
+        train_loader, dataset = create_dataloader_real(
+            train_path,
+            args.imgsz,
+            args.batch_size,
+            gs,
+            single_cls=False,
+            hyp=hyp,
+            augment=False,
+            cache=False,
+            pad=0.0,
+            rect=False,
+            image_weights=False,
+            prefix=colorstr('train: '),
+            limit=-1,
+            workers=args.workers,
+        )
+    else:
+        train_loader, dataset = create_dataloader(
+            train_path,
+            args.imgsz,
+            args.batch_size,
+            gs,
+            single_cls=False,
+            hyp=hyp,
+            augment=False,
+            cache=False,
+            pad=0.0,
+            rect=False,
+            image_weights=False,
+            prefix=colorstr('train: '),
+            limit=-1,
+            add_noise=args.add_noise,
+            brightness_range=args.bri_range,
+            noise_level=args.noise_level,
+            use_linear=args.use_linear,
+            apply_meta_wb_ccm=args.apply_meta_wb_ccm,
+            workers=args.workers,
+        )
+
+    if getattr(args, "fixed_debug_dump", False):
+        debug_dir = os.path.join(base_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        try:
+            # Note: common.raw_reader appends SeAFusion/ into sys.path, which makes the top-level
+            # module name "SeAFusion" resolve to SeAFusion/SeAFusion.py (a module, not a package).
+            # Import via common.raw_reader to avoid "SeAFusion is not a package" errors.
+            from common.raw_reader import process_hq_dng_file as seafusion_process_hq_dng_file
+
+            sample_path = dataset.im_files[0]
+            t0 = seafusion_process_hq_dng_file(sample_path, output_channels=3, apply_wb_ccm=False)
+            t1 = seafusion_process_hq_dng_file(sample_path, output_channels=3, apply_wb_ccm=bool(args.apply_meta_wb_ccm))
+            if t0 is not None and t1 is not None:
+                a = t0.detach().cpu().numpy()[0].transpose(1, 2, 0)
+                b = t1.detach().cpu().numpy()[0].transpose(1, 2, 0)
+                diff = float(np.mean(np.abs(a - b)))
+                LOGGER.info(f"[fixed][debug] apply_wb_ccm diff(mean abs)={diff:.6f} path={sample_path}")
+                # Display gamma for visualization only
+                a_disp = np.clip(a, 0.0, 1.0) ** (1.0 / 2.2)
+                b_disp = np.clip(b, 0.0, 1.0) ** (1.0 / 2.2)
+                cv2.imwrite(os.path.join(debug_dir, "dng_nowbccm_gamma22.png"),
+                            cv2.cvtColor((a_disp * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+                cv2.imwrite(os.path.join(debug_dir, "dng_wbccm_gamma22.png"),
+                            cv2.cvtColor((b_disp * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+        except Exception as e:
+            LOGGER.warning(f"[fixed][debug] failed to dump WB/CCM debug images: {e}")
+
+    learned_cls = _fixed_filter_cls(args.fixed_learn_filter)
+    isp = FixedISPPipeline(cfg, learned_cls).to(device)
+    optimizer = torch.optim.Adam(isp.parameters(), lr=args.lr)
+    try:
+        yolo_model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
+    except Exception:
+        pass
+    compute_loss = ComputeLoss(yolo_model)
+
+    # Number of optimizer steps per "epoch" (ceil to keep at least 1 batch when n < batch_size)
+    steps_per_epoch = max(1, int(math.ceil(len(dataset) / max(1, args.batch_size))))
+    max_steps = max(1, int(args.epochs) * steps_per_epoch)
+    LOGGER.info(f"Fixed ISP training steps: {max_steps} (epochs={args.epochs}, steps/epoch={steps_per_epoch})")
+
+    loader_iter = iter(train_loader)
+    for step in range(max_steps):
+        try:
+            imgs, targets, paths, shapes = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(train_loader)
+            imgs, targets, paths, shapes = next(loader_iter)
+
+        isp.train()
+        imgs = imgs.to(device, non_blocking=True).float()
+        targets = targets.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        retouch, dbg = isp(imgs)
+        preds = yolo_model(retouch)
+        loss, loss_items = compute_loss(preds, targets)
+        loss.backward()
+        optimizer.step()
+
+        if step % cfg.print_freq == 0:
+            LOGGER.info(
+                f"[fixed] step {step}/{max_steps} loss={loss.item():.4f} "
+                f"box={loss_items[0].item():.4f} obj={loss_items[1].item():.4f} cls={loss_items[2].item():.4f}"
+            )
+
+        if step % cfg.summary_freq == 0:
+            writer.add_scalar("fixed/loss_total", loss.item(), step)
+            writer.add_scalar("fixed/loss_box", loss_items[0].item(), step)
+            writer.add_scalar("fixed/loss_obj", loss_items[1].item(), step)
+            writer.add_scalar("fixed/loss_cls", loss_items[2].item(), step)
+            try:
+                writer.add_scalar("fixed/gamma", float(torch.mean(dbg["gamma"]).detach().cpu()), step)
+            except Exception:
+                pass
+
+        if step % cfg.save_model_freq == 0 and step > 0:
+            save_path = os.path.join(ckpt_dir, f"FixedISP_step_{step}.pth")
+            torch.save({"step": step, "isp": isp.state_dict(), "args": vars(args)}, save_path)
+
+    save_path = os.path.join(ckpt_dir, "FixedISP_final.pth")
+    torch.save({"step": max_steps, "isp": isp.state_dict(), "args": vars(args)}, save_path)
+    writer.close()
+
+
 #PYTHONPATH=.. python train.py --data_cfg yolov3/data/lod.yaml --task train_val --data_name lod --weights /root/autodl-tmp/yolov3.pt --yolo_cfg yolov3/models/yolov3.yaml --hyp yolov3/data/hyps/hyp.scratch-low.yaml  --resume experiments/lod-adaptiveisp/ckpt/DynamicISP_iter_41000.pth
 if __name__ == "__main__":
     import argparse
@@ -712,6 +1035,14 @@ if __name__ == "__main__":
         parser.add_argument(name, type=str2bool, nargs='?', const=True, default=default, help=help)
 
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--isp_mode",
+        type=str,
+        default="rl",
+        choices=["rl", "fixed", "fixed_postprocess"],
+        help="rl: original DynamicISP (RL). fixed: fixed-order ISP (learn params only). "
+             "fixed_postprocess: RL mode with fixed meta WB/CCM + optional denoise-first, then RL-selected post pipeline.",
+    )
     parser.add_argument("--task", type=str, default='train_val', help="train, train and val, val")
     parser.add_argument("--batch_size", type=int, default=2, help="batch size")
     parser.add_argument("--epochs", type=int, default=800, help="epochs")
@@ -729,14 +1060,34 @@ if __name__ == "__main__":
     parser.add_argument('--hyp', type=str, default='yolov3/data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
 
     parser.add_argument("--save_path", type=str, default='adaptiveisp', help="save path at experiments/save_path/")
-    parser.add_argument("--data_name", type=str, default='lod', choices=['lod', ], help="train data: lod")
+    parser.add_argument("--data_name", type=str, default='lod', choices=['lod', 'vif'], help="train data: lod or paired vif")
     parser.add_argument('--data_cfg', type=str, default='data/lod.yaml', help='dataset.yaml path (relative to yolov3)')
+    parser.add_argument("--vi_dir_name", type=str, default="vi", help="visible dir name for paired vif path mapping")
+    parser.add_argument("--ir_dir_name", type=str, default="ir", help="infrared dir name for paired vif path mapping")
+    parser.add_argument("--ir_root", type=str, default=None, help="optional infrared root dir (overrides vi/ir dir mapping)")
     add_bool_flag(parser, "--add_noise", default=False, help="add_noise")
     parser.add_argument("--use_linear", action='store_true', default=False, help="use linear noise distribution")
     parser.add_argument("--bri_range", type=float, default=None, nargs='*', help="brightness range, (low, high), 0.0~1.0")
     parser.add_argument("--noise_level", type=float, default=None, help="noise_level, 0.001~0.012")
+    parser.add_argument("--fixed_input", type=str, default="raw", choices=["raw", "srgb"],
+                        help="fixed mode input: raw=LoadImagesAndLabelsRAW, srgb=LoadImagesAndLabelsNormalize")
+    parser.add_argument("--fixed_learn_filter", type=str, default="tone",
+                        choices=["tone", "contrast", "sharpen", "saturation", "exposure"],
+                        help="fixed mode: learn exactly one extra module besides denoise+gamma")
+    add_bool_flag(parser, "--fixed_debug_dump", default=False, help="fixed mode: dump WB/CCM debug images")
+    add_bool_flag(parser, "--apply_meta_wb_ccm", default=True, help="DNG only: apply metadata WB+CCM as fixed steps")
+    add_bool_flag(parser, "--fixed_postprocess_force_gamma", default=True,
+                  help="fixed_postprocess: force GammaFilter as the last step")
+    add_bool_flag(parser, "--force_nlm_first_in_fixed_postprocess_mode", default=False,
+                  help="fixed_postprocess: force NLM as the first step (step 0)")
+    parser.add_argument("--gamma_init", type=float, default=2.2,
+                        help="gamma init value (display gamma, e.g., 2.2); <=0 disables bias")
+    parser.add_argument("--nlm_limit", type=float, default=-1.0,
+                        help="limit NLM strength by scaling its predicted parameter to [0, nlm_limit]; <0 disables")
+    parser.add_argument("--nlm_init", type=float, default=-1.0,
+                        help="initialize NLM strength (0<nlm_init<1); <0 disables")
 
-    add_bool_flag(parser, "--use_truncated", default=True, help="use_truncated")
+    add_bool_flag(parser, "--use_truncated", default=False, help="use_truncated")
     add_bool_flag(parser, "--masking", default=None, help="enable per-operator masking (also affects mask visualization)")
     add_bool_flag(parser, "--relative_brightness", default=False, help="use relative (input-conditioned) dark threshold for invalid retouch")
     parser.add_argument("--retouch_dark_ratio", type=float, default=0.2, help="relative dark threshold: min(abs, input_mean * ratio)")
@@ -753,6 +1104,11 @@ if __name__ == "__main__":
     parser.add_argument("--val_save_path", type=str, default='experiments/adaptiveisp')
     parser.add_argument("--steps", type=int, default=5, help="steps")
     parser.add_argument("--cfg", type=str, default="config", help="config py file")
+    parser.add_argument("--force_filter_name", type=str, default="IF", help="force selecting this filter short name (e.g., IF)")
+    parser.add_argument("--force_filter_step", type=int, default=-1, help="0-indexed step to force filter selection; <0 disables")
+    parser.add_argument("--ifcnn_weights", type=str, default=None, help="IFCNN weights path (for IFCNNFusionFilter)")
+    add_bool_flag(parser, "--ifcnn_trainable", default=None, help="fine-tune IFCNN weights during training")
+    parser.add_argument("--ifcnn_fuse_scheme", type=int, default=None, help="IFCNN fuse scheme: 0=MAX, 1=SUM, 2=MEAN")
 
     args = parser.parse_args()
     args.save_path = args.data_name + '-' + args.save_path
@@ -761,8 +1117,14 @@ if __name__ == "__main__":
         args.bri_range = None
         args.use_linear = False
 
-    Task = DynamicISP(args, args.task)
-    if args.task == "train" or args.task == "train_val":
-        Task.train()
-    elif args.task == "val":
-        Task.val(model_weights=args.model_weights, steps=args.steps)
+    if args.isp_mode == "fixed":
+        if args.task in ("train", "train_val"):
+            run_fixed_isp(args)
+        else:
+            raise ValueError(f"fixed mode only supports --task train/train_val for now, got {args.task!r}")
+    else:
+        Task = DynamicISP(args, args.task)
+        if args.task == "train" or args.task == "train_val":
+            Task.train()
+        elif args.task == "val":
+            Task.val(model_weights=args.model_weights, steps=args.steps)

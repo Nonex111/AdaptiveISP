@@ -81,13 +81,14 @@ class NonLocalMeans(nn.Module):
                 shifted_rgb = torch.roll(rgb, shifts=(y_shift, x_shift), dims=(2, 3))  # (N, 3, H, W)
                 # distance = torch.sqrt(self.box_sum((rgb - shifted_rgb) ** 2) + EPS)  # (N, 3, H, W)
                 # weight = torch.exp(-distance / (torch.pow(h, 2) + EPS))  # (N, 3, H, W)
-                distance = torch.sqrt(torch.relu(self.box_sum((rgb - shifted_rgb) ** 2)))  # (N, 1, H, W)
+                # NOTE: add EPS inside sqrt to avoid NaN gradients at 0 (sqrt'(0)=inf).
+                distance = torch.sqrt(torch.clamp(self.box_sum((rgb - shifted_rgb) ** 2), min=0.0) + EPS)  # (N, 3, H, W)
                 weight = torch.exp(-distance / (torch.relu(h) + EPS))  # (N, 1, H, W)
 
                 denoised_rgb += shifted_rgb * weight  # (N, 3, H, W)
                 weights += weight  # (N, 3, H, W)
 
-        return torch.clamp(denoised_rgb / weights, 0., 1.)  # (N, 3, H, W)
+        return torch.clamp(denoised_rgb / (weights + EPS), 0.0, 1.0)  # (N, 3, H, W)
 
 
 class NonLocalMeansGray(nn.Module):
@@ -110,13 +111,14 @@ class NonLocalMeansGray(nn.Module):
 
                 # distance = torch.sqrt(self.box_sum((y - shifted_y) ** 2) + EPS)  # (N, 1, H, W)
                 # weight = torch.exp(-distance / (torch.pow(h, 2) + EPS))  # (N, 1, H, W)
-                distance = torch.sqrt(torch.relu(self.box_sum((y - shifted_y) ** 2)))  # (N, 1, H, W)
+                # NOTE: add EPS inside sqrt to avoid NaN gradients at 0 (sqrt'(0)=inf).
+                distance = torch.sqrt(torch.clamp(self.box_sum((y - shifted_y) ** 2), min=0.0) + EPS)  # (N, 1, H, W)
                 weight = torch.exp(-distance / (torch.relu(h) + EPS))  # (N, 1, H, W)
 
                 denoised_rgb += shifted_rgb * weight  # (N, 3, H, W)
                 weights += weight  # (N, 1, H, W)
 
-        return torch.clamp(denoised_rgb / weights, 0., 1.)  # (N, 3, H, W)
+        return torch.clamp(denoised_rgb / (weights + EPS), 0.0, 1.0)  # (N, 3, H, W)
 
 
 class NonLocalMeansParam(nn.Module):

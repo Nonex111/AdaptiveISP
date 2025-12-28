@@ -55,7 +55,8 @@ class LoadImagesAndLabelsRAW(LoadImagesAndLabels):
                  add_noise=False,
                  brightness_range=None,
                  noise_level=None,
-                 use_linear=False):
+                 use_linear=False,
+                 apply_meta_wb_ccm: bool = False):
         super(LoadImagesAndLabelsRAW, self).__init__(path, img_size, batch_size, augment, hyp, rect, image_weights,
                                                      cache_images, single_cls, stride, pad, min_items, prefix, limit)
         self.synchronous = False
@@ -66,6 +67,7 @@ class LoadImagesAndLabelsRAW(LoadImagesAndLabels):
         self.brightness_range = brightness_range
         self.noise_level = noise_level
         self.use_linear = use_linear
+        self.apply_meta_wb_ccm = apply_meta_wb_ccm
         self.train = True if 'train' in prefix else False
 
     def __getitem__(self, index):
@@ -155,7 +157,7 @@ class LoadImagesAndLabelsRAW(LoadImagesAndLabels):
         # Prefer raw_reader for DNG to keep linear RAW; fallback to default loader
         f = self.im_files[i]
         if f.lower().endswith('.dng'):
-            raw = process_hq_dng_file(f, output_channels=3)
+            raw = process_hq_dng_file(f, output_channels=3, apply_wb_ccm=self.apply_meta_wb_ccm)
             if raw is not None:
                 img = raw.squeeze(0).permute(1, 2, 0).numpy()  # HWC RGB float32 0-1
                 h0, w0 = img.shape[:2]
@@ -305,7 +307,7 @@ class LoadImagesAndLabelsRAWV2(LoadImagesAndLabels):
     def load_image(self, i):
         f = self.im_files[i]
         if f.lower().endswith('.dng'):
-            raw = process_hq_dng_file(f, output_channels=3)
+            raw = process_hq_dng_file(f, output_channels=3, apply_wb_ccm=getattr(self, "apply_meta_wb_ccm", False))
             if raw is not None:
                 img = raw.squeeze(0).permute(1, 2, 0).numpy()  # HWC RGB float32 0-1
                 h0, w0 = img.shape[:2]
@@ -487,7 +489,7 @@ class LoadImagesAndLabelsRAWHR(LoadImagesAndLabels):
     def load_image(self, i):
         f = self.im_files[i]
         if f.lower().endswith('.dng'):
-            raw = process_hq_dng_file(f, output_channels=3)
+            raw = process_hq_dng_file(f, output_channels=3, apply_wb_ccm=getattr(self, "apply_meta_wb_ccm", False))
             if raw is not None:
                 img = raw.squeeze(0).permute(1, 2, 0).numpy()  # HWC RGB float32 0-1
                 h0, w0 = img.shape[:2]
@@ -528,7 +530,8 @@ class LoadImagesAndLabelsRAWReplay(LoadImagesAndLabels):
                  add_noise=False, 
                  brightness_range=None,
                  noise_level=None,
-                 use_linear=False):
+                 use_linear=False,
+                 apply_meta_wb_ccm: bool = False):
         super(LoadImagesAndLabelsRAWReplay, self).__init__(path, img_size, batch_size, augment, hyp, rect, image_weights,
                                                            cache_images, single_cls, stride, pad, min_items, prefix, limit)
         self.synchronous = False
@@ -539,6 +542,7 @@ class LoadImagesAndLabelsRAWReplay(LoadImagesAndLabels):
         self.noise_level = noise_level
         self.brightness_range = brightness_range
         self.use_linear = use_linear
+        self.apply_meta_wb_ccm = apply_meta_wb_ccm
 
     def __getitem__(self, index):
         # TODO must comment this, just use input index
@@ -624,7 +628,7 @@ class LoadImagesAndLabelsRAWReplay(LoadImagesAndLabels):
         # Prefer raw_reader for DNG to keep linear RAW; fallback to default loader
         f = self.im_files[i]
         if f.lower().endswith('.dng'):
-            raw = process_hq_dng_file(f, output_channels=3)
+            raw = process_hq_dng_file(f, output_channels=3, apply_wb_ccm=self.apply_meta_wb_ccm)
             if raw is not None:
                 img = raw.squeeze(0).permute(1, 2, 0).numpy()  # HWC RGB float32 0-1
                 h0, w0 = img.shape[:2]
@@ -798,16 +802,18 @@ class LoadImagesAndLabelsNormalizeHR(LoadImagesAndLabels):
                  min_items=0,
                  prefix='',
                  limit=-1,
-                 hr_original=False):
+                 hr_original=False,
+                 apply_meta_wb_ccm: bool = False):
         super(LoadImagesAndLabelsNormalizeHR, self).__init__(path, img_size, batch_size, augment, hyp, rect, image_weights,
                                                            cache_images, single_cls, stride, pad, min_items, prefix, limit)
         self.hr_original = hr_original
+        self.apply_meta_wb_ccm = apply_meta_wb_ccm
 
     def _load_original_image(self, index):
         f = self.im_files[index]
         ext = Path(f).suffix.lower()
         if ext == '.dng':
-            raw = process_hq_dng_file(f, output_channels=3)
+            raw = process_hq_dng_file(f, output_channels=3, apply_wb_ccm=getattr(self, "apply_meta_wb_ccm", False))
             if raw is None:
                 raise FileNotFoundError(f'Image Not Found {f}')
             # CHW RGB float32 0-1
@@ -943,13 +949,15 @@ class LoadImagesAndLabelsNormalizeReplay(LoadImagesAndLabels):
                  pad=0.0,
                  min_items=0,
                  prefix='',
-                 limit=-1):
+                 limit=-1,
+                 apply_meta_wb_ccm: bool = False):
         super(LoadImagesAndLabelsNormalizeReplay, self).__init__(path, img_size, batch_size, augment, hyp, rect, image_weights,
                                                                  cache_images, single_cls, stride, pad, min_items, prefix, limit)
         self.synchronous = False
         self.default_batch_size = 64
         self.async_task = None
         self.num_images = len(self.shapes)
+        self.apply_meta_wb_ccm = apply_meta_wb_ccm
 
     def __getitem__(self, index):
         # TODO must comment this, just use input index
@@ -1053,6 +1061,156 @@ class LoadImagesAndLabelsNormalizeReplay(LoadImagesAndLabels):
             path_list.append(path)
             shapes_list.append(shapes)
         # return self.collate_fn_raw([im_list, label_list, path_list, shapes_list])
+        return im_list, label_list, path_list, shapes_list
+
+    def get_next_batch(self, batch_size):
+        if self.synchronous or (self.async_task and batch_size != self.default_batch_size):
+            return self.get_next_batch_(batch_size)
+        else:
+            if self.async_task is None:
+                self.async_task = AsyncTaskManager(target=self.get_next_batch_, args=(self.default_batch_size,))
+            if batch_size != self.default_batch_size:
+                ret = self.get_next_batch_(batch_size)
+            else:
+                ret = self.async_task.get_next()
+            return ret
+
+
+def _pair_ir_path(
+    vi_path: str,
+    vi_dir_name: str = "vi",
+    ir_dir_name: str = "ir",
+    ir_root: str | None = None,
+) -> str:
+    if ir_root:
+        return str(Path(ir_root) / Path(vi_path).name)
+
+    token_src = f"{os.sep}{vi_dir_name}{os.sep}"
+    token_dst = f"{os.sep}{ir_dir_name}{os.sep}"
+    if token_src in vi_path:
+        return vi_path.replace(token_src, token_dst)
+    return vi_path
+
+
+class LoadImagesAndLabelsVIFReplay(LoadImagesAndLabels):
+    """Replay dataset that returns paired (visible, infrared) images.
+
+    Notes:
+    - The base `path` is treated as the visible image list (YOLO-style .txt or directory).
+    - Infrared paths are derived via directory name replacement (e.g., /vi/ -> /ir/) or `ir_root`.
+    - For simplicity and correctness, `augment=True` is not supported (paired geometric augment needs shared transforms).
+    """
+
+    def __init__(
+        self,
+        path,
+        img_size=640,
+        batch_size=16,
+        augment=False,
+        hyp=None,
+        rect=False,
+        image_weights=False,
+        cache_images=False,
+        single_cls=False,
+        stride=32,
+        pad=0.0,
+        min_items=0,
+        prefix="",
+        limit=-1,
+        vi_dir_name: str = "vi",
+        ir_dir_name: str = "ir",
+        ir_root: str | None = None,
+    ):
+        super().__init__(path, img_size, batch_size, augment, hyp, rect, image_weights, cache_images, single_cls, stride, pad, min_items, prefix, limit)
+        self.synchronous = False
+        self.default_batch_size = 64
+        self.async_task = None
+        self.num_images = len(self.shapes)
+        self.vi_dir_name = vi_dir_name
+        self.ir_dir_name = ir_dir_name
+        self.ir_root = ir_root
+        self._warned_ir = False
+
+    def __getitem__(self, index):
+        # TODO must comment this, just use input index
+        # index = self.indices[index]  # linear, shuffled, or image_weights
+        if self.augment:
+            raise NotImplementedError("VIF paired dataset does not support augment=True yet.")
+
+        hyp = self.hyp
+        mosaic = self.mosaic and random.random() < hyp["mosaic"]
+        if mosaic:
+            raise NotImplementedError("VIF paired dataset does not support mosaic/mixup yet.")
+
+        # Load visible image from base loader (BGR uint8)
+        vi_bgr, (h0, w0), (h, w) = self.load_image(index)
+
+        # Load infrared image (grayscale or BGR uint8) and align to visible size before letterbox.
+        vi_path = self.im_files[index]
+        ir_path = _pair_ir_path(vi_path, vi_dir_name=self.vi_dir_name, ir_dir_name=self.ir_dir_name, ir_root=self.ir_root)
+        ir = cv2.imread(ir_path, cv2.IMREAD_UNCHANGED)
+        if ir is None:
+            if not self._warned_ir:
+                LOGGER.warning(f"Infrared image not found, falling back to visible grayscale. Example: {ir_path}")
+                self._warned_ir = True
+            ir = cv2.cvtColor(vi_bgr, cv2.COLOR_BGR2GRAY)
+
+        if ir.ndim == 2:
+            ir_bgr = cv2.cvtColor(ir, cv2.COLOR_GRAY2BGR)
+        elif ir.ndim == 3 and ir.shape[2] >= 3:
+            ir_bgr = ir[:, :, :3]
+        else:
+            ir_bgr = cv2.cvtColor(vi_bgr, cv2.COLOR_BGR2GRAY)
+            ir_bgr = cv2.cvtColor(ir_bgr, cv2.COLOR_GRAY2BGR)
+
+        if ir_bgr.shape[:2] != vi_bgr.shape[:2]:
+            ir_bgr = cv2.resize(ir_bgr, (vi_bgr.shape[1], vi_bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+        # Letterbox both with identical target shape.
+        shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size
+        vi_bgr, ratio, pad = letterbox(vi_bgr, shape, auto=False, scaleup=self.augment, color=(0, 0, 0))
+        ir_bgr, _, _ = letterbox(ir_bgr, shape, auto=False, scaleup=self.augment, color=(0, 0, 0))
+        shapes = (h0, w0), ((h / h0, w / w0), pad)
+
+        labels = self.labels[index].copy()
+        if labels.size:
+            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+        nl = len(labels)
+        if nl:
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=vi_bgr.shape[1], h=vi_bgr.shape[0], clip=True, eps=1e-3)
+
+        labels_out = torch.zeros((nl, 6))
+        if nl:
+            labels_out[:, 1:] = torch.from_numpy(labels)
+
+        # Convert images to RGB float NCHW
+        vi = vi_bgr.transpose((2, 0, 1))[::-1]
+        ir_rgb = ir_bgr.transpose((2, 0, 1))[::-1]
+        vi = np.ascontiguousarray(vi) / 255.0
+        ir_rgb = np.ascontiguousarray(ir_rgb) / 255.0
+
+        return (torch.from_numpy(vi), torch.from_numpy(ir_rgb)), labels_out, self.im_files[index], shapes
+
+    def get_next_batch_(self, batch_size):
+        batch = []
+        while len(batch) < batch_size:
+            s = min(len(self.indices), batch_size - len(batch))
+            batch += self.indices[:s]
+            self.indices = self.indices[s:]
+            if len(self.indices) == 0:
+                self.indices = list(range(self.num_images))
+                random.shuffle(self.indices)
+        im_list = []
+        label_list = []
+        path_list = []
+        shapes_list = []
+        for i in range(len(batch)):
+            im, label, path, shapes = self.__getitem__(batch[i])
+            im_list.append(im)
+            label_list.append(label)
+            path_list.append(path)
+            shapes_list.append(shapes)
         return im_list, label_list, path_list, shapes_list
 
     def get_next_batch(self, batch_size):

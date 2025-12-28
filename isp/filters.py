@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from easydict import EasyDict
 from isp.denoise import NonLocalMeans, NonLocalMeansGray
-from isp.sharpen import unsharp_mask, adjust_sharpness, sharpness
+from isp.sharpen import gaussian_blur_torch, unsharp_mask, adjust_sharpness, sharpness
+from fusion.ifcnn import build_ifcnn, ensure_3ch, imagenet_denormalize, imagenet_normalize, load_ifcnn_weights
 
 
 def rgb2lum(image):
@@ -88,7 +89,7 @@ class Filter(torch.nn.Module):
         return False
 
     # Apply the whole filter with masking
-    def forward(self, img, img_features=None, specified_parameter=None, high_res=None):
+    def forward(self, img, img_features=None, specified_parameter=None, high_res=None, extra=None):
         if self.predict:
             assert (img_features is None) ^ (specified_parameter is None)
         if img_features is not None:
@@ -213,6 +214,126 @@ class Filter(torch.nn.Module):
         return canvas
 
 
+class FusionFilterBase(Filter):
+    def __init__(self, cfg, short_name: str, predict: bool = False):
+        # Keep a dummy "parameter" dimension for compatibility with Filter.__init__ when predict=True.
+        super().__init__(cfg, short_name, num_filter_parameters=1, predict=predict)
+
+    def use_masking(self):
+        return False
+
+    @staticmethod
+    def _dummy_debug(img: torch.Tensor) -> dict:
+        return {
+            "filter_parameters": img.new_zeros((1,)),
+            "mask": img.new_ones((1, 1, 1, 1)),
+        }
+
+    def _get_vi_ir(self, img: torch.Tensor, extra) -> tuple[torch.Tensor, torch.Tensor]:
+        vi = ensure_3ch(img)
+        ir = None
+        if isinstance(extra, dict):
+            ir = extra.get("ir", None)
+
+        if ir is None:
+            ir = rgb2lum(vi).repeat(1, 3, 1, 1)
+        else:
+            ir = ensure_3ch(ir)
+            if ir.shape[-2:] != vi.shape[-2:]:
+                ir = F.interpolate(ir, size=vi.shape[-2:], mode="bilinear", align_corners=False)
+        return vi, ir
+
+
+class MaxFusionFilter(FusionFilterBase):
+    """Simple pixel-wise max fusion (no weights)."""
+
+    def __init__(self, cfg, predict: bool = False):
+        super().__init__(cfg, "Fmax", predict=predict)
+
+    def forward(self, img, img_features=None, specified_parameter=None, high_res=None, extra=None):
+        vi, ir = self._get_vi_ir(img, extra)
+        out = torch.maximum(vi, ir)
+        out = torch.clip(out, 0.0, 1.0)
+        return out, None, self._dummy_debug(img)
+
+    def visualize_filter(self, debug_info, canvas):
+        if canvas.shape[0] == 64:
+            cv2.rectangle(canvas, (8, 40), (56, 52), (1, 1, 1), cv2.FILLED)
+            cv2.putText(canvas, 'F max', (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0))
+        else:
+            self.draw_high_res_text('Fusion (max)', canvas)
+
+
+class MeanFusionFilter(FusionFilterBase):
+    """Simple pixel-wise mean fusion (no weights)."""
+
+    def __init__(self, cfg, predict: bool = False):
+        super().__init__(cfg, "Favg", predict=predict)
+
+    def forward(self, img, img_features=None, specified_parameter=None, high_res=None, extra=None):
+        vi, ir = self._get_vi_ir(img, extra)
+        out = (vi + ir) * 0.5
+        out = torch.clip(out, 0.0, 1.0)
+        return out, None, self._dummy_debug(img)
+
+    def visualize_filter(self, debug_info, canvas):
+        if canvas.shape[0] == 64:
+            cv2.rectangle(canvas, (8, 40), (56, 52), (1, 1, 1), cv2.FILLED)
+            cv2.putText(canvas, 'F avg', (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0))
+        else:
+            self.draw_high_res_text('Fusion (avg)', canvas)
+
+
+class IFCNNFusionFilter(FusionFilterBase):
+    """IFCNN-based fusion. Uses visible input `img` and optional infrared `extra['ir']`."""
+
+    def __init__(self, cfg, predict: bool = False):
+        super().__init__(cfg, "IF", predict=predict)
+        fuse_scheme = int(getattr(cfg, "ifcnn_fuse_scheme", 0))
+        self.ifcnn = build_ifcnn(fuse_scheme=fuse_scheme, resnet_pretrained=False)
+
+        weights_path = getattr(cfg, "ifcnn_weights", None)
+        if weights_path:
+            load_ifcnn_weights(self.ifcnn, weights_path, map_location="cpu")
+
+        self.trainable = bool(getattr(cfg, "ifcnn_trainable", False))
+        self._set_trainable(self.trainable)
+
+    def _set_trainable(self, trainable: bool) -> None:
+        for p in self.ifcnn.parameters():
+            p.requires_grad = trainable
+        if not trainable:
+            self.ifcnn.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if not self.trainable:
+            self.ifcnn.eval()
+        return self
+
+    def forward(self, img, img_features=None, specified_parameter=None, high_res=None, extra=None):
+        vi, ir = self._get_vi_ir(img, extra)
+        vi_n = imagenet_normalize(torch.clip(vi, 0.0, 1.0))
+        ir_n = imagenet_normalize(torch.clip(ir, 0.0, 1.0))
+
+        if self.trainable:
+            out_n = self.ifcnn(vi_n, ir_n)
+        else:
+            with torch.no_grad():
+                out_n = self.ifcnn(vi_n, ir_n)
+
+        out = imagenet_denormalize(out_n)
+        out = torch.clip(out, 0.0, 1.0)
+        return out, None, self._dummy_debug(img)
+
+    def visualize_filter(self, debug_info, canvas):
+        if canvas.shape[0] == 64:
+            cv2.rectangle(canvas, (8, 40), (56, 52), (1, 1, 1), cv2.FILLED)
+            cv2.putText(canvas, 'IFCNN', (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0))
+        else:
+            self.draw_high_res_text('IFCNN', canvas)
+
+
 class ExposureFilter(Filter):
 
     def __init__(self, cfg, predict=False):
@@ -240,7 +361,19 @@ class GammaFilter(Filter):
 
     def filter_param_regressor(self, features):
         log_gamma_range = np.log(self.cfg.gamma_range)
-        return torch.exp(tanh_range(-log_gamma_range, log_gamma_range)(features))
+        init_log = None
+        gamma_init = getattr(self.cfg, "gamma_init", None)
+        if gamma_init is not None:
+            try:
+                gamma_val = float(gamma_init)
+                if gamma_val > 0:
+                    # Interpret as display gamma (e.g., 2.2), while this filter parameter is the exponent.
+                    exponent_init = 1.0 / gamma_val
+                    exponent_init = float(np.clip(exponent_init, 1.0 / self.cfg.gamma_range, self.cfg.gamma_range))
+                    init_log = float(np.log(exponent_init))
+            except Exception:
+                init_log = None
+        return torch.exp(tanh_range(-log_gamma_range, log_gamma_range, initial=init_log)(features))
 
     def process(self, img, param):
         return torch.pow(torch.clip(img, 0.001), param[:, :, None, None])
@@ -361,6 +494,36 @@ class ToneFilter(Filter):
             p2 = tuple(
                     map(int, (width / self.curve_steps * (j + 1), height - 1 - values[j + 1] * height)))
             cv2.line(canvas, p1, p2, (0, 0, 0), thickness=1)
+
+
+class LogToneMapFilter(Filter):
+    """Simple learnable global tone mapping via log curve.
+
+    y = log(1 + k*x) / log(1 + k),  k >= 0
+    """
+
+    def __init__(self, cfg, predict=False):
+        Filter.__init__(self, cfg, 'LT', 1, predict)
+
+    def filter_param_regressor(self, features):
+        k_max = float(getattr(self.cfg, 'log_tone_k_max', 20.0))
+        k_init = float(getattr(self.cfg, 'log_tone_k_init', 3.0))
+        return tanh_range(0.0, k_max, initial=k_init)(features)
+
+    def process(self, img, param):
+        img = torch.clip(img, min=0.0, max=1.0)
+        k = torch.relu(param[:, :, None, None])
+        denom = torch.log1p(k)
+        out = torch.where(denom > 1e-6, torch.log1p(k * img) / denom, img)
+        return torch.clip(out, 0.0, 1.0)
+
+    def visualize_filter(self, debug_info, canvas):
+        k = float(debug_info['filter_parameters'][0].detach().cpu().numpy())
+        if canvas.shape[0] == 64:
+            cv2.rectangle(canvas, (8, 40), (56, 52), (1, 1, 1), cv2.FILLED)
+            cv2.putText(canvas, f'LT {k:.2f}', (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0))
+        else:
+            self.draw_high_res_text(f'LogTone {k:.2f}', canvas)
 
 
 class ToneFilterV2(Filter):
@@ -578,7 +741,29 @@ class DenoiseFilter(Filter):
         self.denoise = NonLocalMeansGray(search_window_size=11, patch_size=5)  # gray mode 3x faster than rgb mode
 
     def filter_param_regressor(self, features):
-        return F.sigmoid(features)
+        # Base prediction in (0, 1). Larger value => stronger smoothing.
+        nlm_init = getattr(self.cfg, "nlm_init", None)
+        if nlm_init is not None:
+            try:
+                init = float(nlm_init)
+                if 0.0 < init < 1.0:
+                    init = float(np.clip(init, 1e-4, 1.0 - 1e-4))
+                    bias = math.log(init / (1.0 - init))
+                    features = features + features.new_tensor(bias)
+            except Exception:
+                pass
+
+        param = torch.sigmoid(features)
+
+        nlm_limit = getattr(self.cfg, "nlm_limit", None)
+        if nlm_limit is not None:
+            try:
+                limit = float(np.clip(float(nlm_limit), 0.0, 1.0))
+                if limit < 1.0:
+                    param = param * param.new_tensor(limit)
+            except Exception:
+                pass
+        return param
         # return tanh_range(*self.cfg.nlm_range)(features)
 
     def process(self, img, param):
@@ -593,6 +778,62 @@ class DenoiseFilter(Filter):
             cv2.putText(canvas, 'NLM %+.2f' % thresh, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0))
         else:
             self.draw_high_res_text('NLM %+.2f' % thresh, canvas)
+
+
+class GaussianDenoiseFilter(Filter):
+    """Lightweight learnable Gaussian denoise.
+
+    Applies a Gaussian blur with learnable per-image sigma, and blends it with the input by learnable strength.
+    """
+
+    def __init__(self, cfg, predict=False):
+        Filter.__init__(self, cfg, 'GD', 2, predict)
+        self.num_filter_parameters = 2
+
+    def filter_param_regressor(self, features):
+        sigma_min, sigma_max = getattr(self.cfg, 'gaussian_sigma_range', (0.2, 2.0))
+        sigma = tanh_range(float(sigma_min), float(sigma_max), initial=(float(sigma_min) + float(sigma_max)) * 0.5)(
+            features[:, 0:1]
+        )
+        strength = torch.sigmoid(features[:, 1:2])
+        return torch.cat([sigma, strength], dim=1)
+
+    def process(self, img, param):
+        img = torch.clip(img, min=0.0, max=1.0)
+        sigma = torch.relu(param[:, 0])
+        strength = torch.clip(param[:, 1:2], 0.0, 1.0)[:, :, None, None]
+
+        kernel_size = int(getattr(self.cfg, 'gaussian_kernel_size', 5))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        if img.ndim > 3 and sigma.shape[0] > 1:
+            out = torch.empty_like(img)
+            for b in range(img.shape[0]):
+                blurred = gaussian_blur_torch(
+                    img[b],
+                    kernel_size=[kernel_size, kernel_size],
+                    sigma=sigma[b].clamp_min(1e-3),
+                )
+                out[b] = img[b] + (blurred - img[b]) * strength[b]
+            return torch.clip(out, 0.0, 1.0)
+
+        blurred = gaussian_blur_torch(
+            img,
+            kernel_size=[kernel_size, kernel_size],
+            sigma=sigma.squeeze(0).clamp_min(1e-3),
+        )
+        out = img + (blurred - img) * strength
+        return torch.clip(out, 0.0, 1.0)
+
+    def visualize_filter(self, debug_info, canvas):
+        sigma = float(debug_info['filter_parameters'][0].detach().cpu().numpy())
+        strength = float(debug_info['filter_parameters'][1].detach().cpu().numpy())
+        if canvas.shape[0] == 64:
+            cv2.rectangle(canvas, (8, 40), (56, 52), (1, 1, 1), cv2.FILLED)
+            cv2.putText(canvas, f'GD s{sigma:.2f} a{strength:.2f}', (4, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (0, 0, 0))
+        else:
+            self.draw_high_res_text(f'GaussDenoise {sigma:.2f} {strength:.2f}', canvas)
 
 
 class SharpenUSMFilter(Filter):

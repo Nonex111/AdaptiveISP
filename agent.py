@@ -84,13 +84,53 @@ class Agent(nn.Module):
         self.fc1 = nn.Linear(cfg.feature_extractor_dims, cfg.fc1_size)
         self.lrelu = nn.LeakyReLU(negative_slope=0.2)
         self.fc2 = nn.Linear(cfg.fc1_size, len(self.filters))
-        self.softmax = nn.Softmax()
+        self.softmax = nn.Softmax(dim=1)
         self.down_sample = nn.AdaptiveAvgPool2d((shape[1], shape[2]))
         self.runtime = torch.tensor(cfg.filters_runtime, requires_grad=False).to(device)
 
+        # Forced filter selection schedule: step (int) -> filter id (int).
+        # Supports the legacy single (force_filter_name, force_filter_step) and an optional
+        # cfg.force_filter_schedule mapping, e.g. {0: "NLM", 5: "G"}.
+        self.force_filter_ids_by_step = {}
+        legacy_step = getattr(cfg, "force_filter_step", None)
+        legacy_name = getattr(cfg, "force_filter_name", None)
+        if legacy_name is None:
+            legacy_name = getattr(cfg, "force_filter_short_name", None)
+        if legacy_name is not None and legacy_step is not None:
+            for i, f in enumerate(self.filters):
+                if f.get_short_name() == str(legacy_name):
+                    self.force_filter_ids_by_step[int(legacy_step)] = int(i)
+                    break
+
+        schedule = getattr(cfg, "force_filter_schedule", None)
+        if schedule:
+            items = schedule.items() if isinstance(schedule, dict) else schedule
+            for step, name in items:
+                if name is None:
+                    continue
+                for i, f in enumerate(self.filters):
+                    if f.get_short_name() == str(name):
+                        try:
+                            self.force_filter_ids_by_step[int(step)] = int(i)
+                        except Exception:
+                            pass
+                        break
+
+        self.disallow_after_step0_ids = []
+        disallow_names = getattr(cfg, "disallow_filter_short_names_after_step0", None)
+        if disallow_names:
+            disallow_set = set(disallow_names)
+            for i, f in enumerate(self.filters):
+                if f.get_short_name() in disallow_set:
+                    self.disallow_after_step0_ids.append(int(i))
+
     def forward(self, inp, progress, high_res=None, selected_filter_id=None):
         train = 1 if self.training else 0
-        x, z, states = inp
+        extra = None
+        if isinstance(inp, (tuple, list)) and len(inp) == 4:
+            x, z, states, extra = inp
+        else:
+            x, z, states = inp
 
         selection_noise = z[:, 0:1]
         filtered_images = []
@@ -106,7 +146,9 @@ class Agent(nn.Module):
         for j, filter in enumerate(self.filters):
             # print('    creating filter:', j, 'name:', str(filter.__class__), 'abbr.', filter.get_short_name())
             # print('      filter_features:', filter_features.shape)
-            filtered_image_batch, high_res_output, per_filter_debug_info = filter(x, filter_features, high_res=high_res)
+            filtered_image_batch, high_res_output, per_filter_debug_info = filter(
+                x, filter_features, high_res=high_res, extra=extra
+            )
             high_res_outputs.append(high_res_output)
             filtered_images.append(filtered_image_batch)
             filter_debug_info.append(per_filter_debug_info)
@@ -132,8 +174,20 @@ class Agent(nn.Module):
         pdf = pdf * (1 - self.cfg.exploration) + self.cfg.exploration * 1.0 / len(self.filters)
         # pdf = tf.to_float(is_train) * tf.concat([pdf[:, :1], pdf[:, 1:] * states[:, STATE_DROPOUT_BEGIN:]], axis=1) \
         # + (1.0 - tf.to_float(is_train)) * pdf
+        if self.disallow_after_step0_ids:
+            step = states[:, STATE_STEP_DIM]
+            not_first = step > 0.5
+            if torch.any(not_first):
+                pdf = pdf.clone()
+                for idx in self.disallow_after_step0_ids:
+                    pdf[not_first, idx] = 0.0
+                row_sum = torch.sum(pdf, dim=1, keepdim=True)
+                zero_rows = row_sum < 1e-12
+                if torch.any(zero_rows):
+                    pdf[zero_rows.squeeze(1)] = 1.0 / len(self.filters)
         pdf = pdf / (torch.sum(pdf, dim=1, keepdim=True) + 1e-30)
-        entropy = -pdf * torch.log(pdf)
+        # Avoid NaNs when some actions are hard-masked to probability 0 (e.g., fixed_postprocess).
+        entropy = -pdf * torch.log(pdf + 1e-10)
         entropy = torch.sum(entropy, dim=1)[:, None]
         # print('    pdf:', pdf.shape)
         # print('    entropy:', entropy.shape)
@@ -144,6 +198,15 @@ class Agent(nn.Module):
             selected_filter_id = torch.from_numpy(np.array([selected_filter_id] * max_filter_id.shape[0])).to(torch.int64).to(max_filter_id.device)
         else:
             selected_filter_id = (train * random_filter_id + (1 - train) * max_filter_id).to(torch.int64)
+
+        # Optionally force specific filters at specific steps.
+        if self.force_filter_ids_by_step:
+            step = states[:, STATE_STEP_DIM:STATE_STEP_DIM + 1]
+            for force_step in sorted(self.force_filter_ids_by_step.keys()):
+                force_mask = (torch.abs(step - float(force_step)) < 1e-4).squeeze(1)
+                if torch.any(force_mask):
+                    forced = torch.full_like(selected_filter_id, int(self.force_filter_ids_by_step[force_step]))
+                    selected_filter_id = torch.where(force_mask, forced, selected_filter_id)
         # print("selected_filter_id", selected_filter_id, random_filter_id, max_filter_id)
         # print('    selected_filter_id:', selected_filter_id.shape)
 
@@ -305,4 +368,3 @@ if __name__ == "__main__":
     agent((x, z, states), 0.1)
     print(agent.state_dict())
     # torch.save(agent.state_dict(), "agent.pth")
-

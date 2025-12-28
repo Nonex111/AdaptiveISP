@@ -7,10 +7,6 @@ import math
 from typing import List, Tuple
 from torch import Tensor
 
-import torchvision
-from torchvision.transforms.functional_tensor import torch_pad # _cast_squeeze_in, _cast_squeeze_out, 
-# from torchvision.transforms.functional_tensor import _max_value
-
 
 def _get_gaussian_kernel1d(kernel_size: int, sigma: Tensor) -> Tensor:
     ksize_half = (kernel_size - 1) * 0.5
@@ -74,7 +70,7 @@ def gaussian_blur_torch(img, kernel_size: List[int], sigma: Tensor) -> Tensor:
 
     # padding = (left, right, top, bottom)
     padding = [kernel_size[0] // 2, kernel_size[0] // 2, kernel_size[1] // 2, kernel_size[1] // 2]
-    img = torch_pad(img, padding, mode="reflect")
+    img = F.pad(img, padding, mode="reflect")
     img = conv2d(img, kernel, groups=img.shape[-3])
 
     img = _cast_squeeze_out(img, need_cast, need_squeeze, out_dtype)
@@ -183,6 +179,7 @@ def sharpness(image: torch.Tensor, factor: (torch.Tensor, float)) -> torch.Tenso
 
 
 if __name__ == "__main__":
+    import torchvision
     a = np.arange(50, step=2).reshape((1, 1, 5, 5))
     # print(scipy.ndimage.gaussian_filter(a, sigma=1))
     a = torch.tensor(a)

@@ -747,7 +747,8 @@ class LoadImagesAndLabels(Dataset):
                 if ext == '.dng':
                     if process_hq_dng_file is None:
                         raise RuntimeError('process_hq_dng_file unavailable. Ensure PYTHONPATH includes project root and raw dependencies are installed.')
-                    dng_tensor = process_hq_dng_file(f)
+                    apply_wb_ccm = getattr(self, "apply_meta_wb_ccm", False)
+                    dng_tensor = process_hq_dng_file(f, apply_wb_ccm=apply_wb_ccm)
                     assert dng_tensor is not None, f'process_hq_dng_file returned None: {f}'
                     np_im = dng_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
                     np_im = (np_im.clip(0.0, 1.0) * 255.0).astype(np.uint8)
@@ -769,7 +770,8 @@ class LoadImagesAndLabels(Dataset):
         if not f.exists():
             ext = Path(self.im_files[i]).suffix.lower()
             if ext == '.dng' and process_hq_dng_file is not None:
-                dng_tensor = process_hq_dng_file(self.im_files[i])
+                apply_wb_ccm = getattr(self, "apply_meta_wb_ccm", False)
+                dng_tensor = process_hq_dng_file(self.im_files[i], apply_wb_ccm=apply_wb_ccm)
                 assert dng_tensor is not None, f'Image Not Found {self.im_files[i]}'
                 np_im = dng_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
                 np_im = (np_im.clip(0.0, 1.0) * 255.0).astype(np.uint8)

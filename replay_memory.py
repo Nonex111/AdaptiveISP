@@ -2,17 +2,35 @@ import random
 import numpy as np
 from util import Dict
 from util import STATE_STEP_DIM, STATE_STOPPED_DIM
-from dataset import LoadImagesAndLabelsRAWReplay, LoadImagesAndLabelsNormalizeReplay
+from dataset import LoadImagesAndLabelsRAWReplay, LoadImagesAndLabelsNormalizeReplay, LoadImagesAndLabelsVIFReplay
 import torch
 
 
 def create_input_tensor(batch):
     im_list, label_list, path_list, shapes_list, states_list = batch
+    labels_cat = []
     for i, lb in enumerate(label_list):
-        lb[:, 0] = i  # add target image index for build_targets()
-    return torch.from_numpy(np.stack(im_list, 0)), \
-           torch.from_numpy(np.concatenate(label_list, 0)), path_list, shapes_list, \
-           torch.from_numpy(np.stack(states_list, 0))
+        if isinstance(lb, torch.Tensor):
+            lb[:, 0] = i  # add target image index for build_targets()
+            labels_cat.append(lb)
+        else:
+            lb = np.array(lb, copy=True)
+            lb[:, 0] = i
+            labels_cat.append(torch.from_numpy(lb))
+
+    def as_cpu_tensor(x):
+        return x if isinstance(x, torch.Tensor) else torch.from_numpy(x)
+
+    if len(im_list) > 0 and isinstance(im_list[0], (tuple, list)) and len(im_list[0]) == 2:
+        vi = torch.stack([as_cpu_tensor(im[0]) for im in im_list], dim=0)
+        ir = torch.stack([as_cpu_tensor(im[1]) for im in im_list], dim=0)
+        images = (vi, ir)
+    else:
+        images = torch.stack([as_cpu_tensor(im) for im in im_list], dim=0)
+
+    labels = torch.cat(labels_cat, dim=0) if labels_cat else torch.zeros((0, 6), dtype=torch.float32)
+    states = torch.from_numpy(np.stack(states_list, 0))
+    return images, labels, path_list, shapes_list, states
 
 
 def get_noise(batch_size, z_type="uniform", z_dim=27):
@@ -56,7 +74,11 @@ class ReplayMemory:
                  add_noise=False,
                  brightness_range=None,
                  noise_level=None,
-                 use_linear=False):
+                 use_linear=False,
+                 vi_dir_name: str = "vi",
+                 ir_dir_name: str = "ir",
+                 ir_root: str | None = None,
+                 apply_meta_wb_ccm: bool = False):
         self.cfg = cfg
         if data_name == "coco":
             self.dataset = LoadImagesAndLabelsRAWReplay(
@@ -77,6 +99,7 @@ class ReplayMemory:
                 brightness_range=brightness_range,
                 noise_level=noise_level,
                 use_linear=use_linear,
+                apply_meta_wb_ccm=apply_meta_wb_ccm,
             )
         elif data_name in ("lod", "oprd", "rod"):
             self.dataset = LoadImagesAndLabelsNormalizeReplay(
@@ -93,6 +116,26 @@ class ReplayMemory:
                 image_weights=image_weights,
                 prefix=prefix,
                 limit=limit,
+                apply_meta_wb_ccm=apply_meta_wb_ccm,
+            )
+        elif data_name in ("vif",):
+            self.dataset = LoadImagesAndLabelsVIFReplay(
+                path,
+                imgsz,
+                batch_size,
+                augment=augment,
+                hyp=hyp,
+                rect=rect,
+                cache_images=cache,
+                single_cls=single_cls,
+                stride=int(stride),
+                pad=pad,
+                image_weights=image_weights,
+                prefix=prefix,
+                limit=limit,
+                vi_dir_name=vi_dir_name,
+                ir_dir_name=ir_dir_name,
+                ir_root=ir_root,
             )
         else:
             raise ValueError("ReplayMemory input data_name error!")
@@ -193,12 +236,15 @@ class ReplayMemory:
         # np.stack(states_list, axis=0)
 
     @staticmethod
-    def images_and_states_to_records(images, labels, paths, shapes, states):
+    def images_and_states_to_records(images, labels, paths, shapes, states, ir_images=None):
         assert len(images) == len(states)
         records = []
         for i in range(len(images)):
+            im = images[i]
+            if ir_images is not None:
+                im = (images[i], ir_images[i])
             records.append(Dict(
-                im=images[i],
+                im=im,
                 label=labels[i],
                 path=paths[i],
                 shape=shapes[i],

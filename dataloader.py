@@ -47,7 +47,8 @@ def create_dataloader(path,
                       add_noise=False,
                       brightness_range=None,
                       noise_level=None,
-                      use_linear=False):
+                      use_linear=False,
+                      apply_meta_wb_ccm: bool = False):
     if rect and shuffle:
         LOGGER.warning('WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
@@ -70,6 +71,7 @@ def create_dataloader(path,
             brightness_range=brightness_range,
             noise_level=noise_level,
             use_linear=use_linear,
+            apply_meta_wb_ccm=apply_meta_wb_ccm,
         )
 
     batch_size = min(batch_size, len(dataset))
