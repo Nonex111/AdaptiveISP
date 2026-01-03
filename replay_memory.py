@@ -1,5 +1,6 @@
 import random
 import numpy as np
+from typing import Optional
 from util import Dict
 from util import STATE_STEP_DIM, STATE_STOPPED_DIM
 from dataset import LoadImagesAndLabelsRAWReplay, LoadImagesAndLabelsNormalizeReplay, LoadImagesAndLabelsVIFReplay
@@ -77,7 +78,10 @@ class ReplayMemory:
                  use_linear=False,
                  vi_dir_name: str = "vi",
                  ir_dir_name: str = "ir",
-                 ir_root: str | None = None,
+                 ir_root: Optional[str] = None,
+                 ir_use_y16: bool = True,
+                 ir_width: Optional[int] = None,
+                 ir_height: Optional[int] = None,
                  apply_meta_wb_ccm: bool = False):
         self.cfg = cfg
         if data_name == "coco":
@@ -136,6 +140,10 @@ class ReplayMemory:
                 vi_dir_name=vi_dir_name,
                 ir_dir_name=ir_dir_name,
                 ir_root=ir_root,
+                ir_use_y16=ir_use_y16,
+                ir_width=ir_width,
+                ir_height=ir_height,
+                vi_apply_wb_ccm=apply_meta_wb_ccm,
             )
         else:
             raise ValueError("ReplayMemory input data_name error!")

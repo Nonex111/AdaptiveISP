@@ -59,8 +59,21 @@ class Value(nn.Module):
 
         self.down_sample = nn.AdaptiveAvgPool2d((shape[1], shape[2]))
 
-    def forward(self, images, states=None):
+    @staticmethod
+    def _ir_as_gray(ir: torch.Tensor) -> torch.Tensor:
+        if ir.dim() != 4:
+            raise ValueError(f"Expected IR as NCHW, got shape={tuple(ir.shape)}")
+        if ir.shape[1] == 1:
+            return ir
+        if ir.shape[1] == 3:
+            return (0.27 * ir[:, 0:1] + 0.67 * ir[:, 1:2] + 0.06 * ir[:, 2:3])
+        raise ValueError(f"Expected IR with 1 or 3 channels, got C={ir.shape[1]}")
+
+    def forward(self, images, states=None, ir=None):
         images = self.down_sample(images)
+        if ir is not None and bool(getattr(self.cfg, "include_ir_in_value", False)):
+            ir = self.down_sample(self._ir_as_gray(ir))
+            images = torch.cat([images, ir], dim=1)
         lum = (images[:, 0, :, :] * 0.27 + images[:, 1, :, :] * 0.67 + images[:, 2, :, :] * 0.06 + 1e-5)[:, None, :, :]
         # print(lum.shape)
         # luminance and contrast

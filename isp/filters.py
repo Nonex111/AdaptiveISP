@@ -4,6 +4,7 @@ import cv2
 import math
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple
 from easydict import EasyDict
 from isp.denoise import NonLocalMeans, NonLocalMeansGray
 from isp.sharpen import gaussian_blur_torch, unsharp_mask, adjust_sharpness, sharpness
@@ -206,8 +207,37 @@ class Filter(torch.nn.Module):
         assert False
 
     def visualize_mask(self, debug_info, res):
-        return cv2.resize(debug_info['mask'].cpu().numpy() * np.ones((1, 1, 3), dtype=np.float32),
-                          dsize=res, interpolation=cv2.INTER_NEAREST)
+        mask = debug_info.get('mask', None)
+        if mask is None:
+            return np.ones((res[1], res[0], 3), dtype=np.float32)
+
+        if isinstance(mask, torch.Tensor):
+            mask_np = mask.detach().cpu().numpy()
+        else:
+            mask_np = np.asarray(mask)
+
+        mask_np = np.squeeze(mask_np).astype(np.float32, copy=False)
+        if mask_np.ndim == 0:
+            mask_np = np.full((1, 1, 1), float(mask_np), dtype=np.float32)
+        elif mask_np.ndim == 1:
+            if mask_np.size == 3:
+                mask_np = mask_np.reshape(1, 1, 3)
+            else:
+                mask_np = mask_np.reshape(1, mask_np.size, 1)
+        elif mask_np.ndim == 2:
+            mask_np = mask_np[:, :, None]
+        elif mask_np.ndim == 3:
+            if mask_np.shape[-1] not in (1, 3) and mask_np.shape[0] in (1, 3):
+                mask_np = np.transpose(mask_np, (1, 2, 0))
+            if mask_np.shape[-1] not in (1, 3):
+                mask_np = mask_np[..., :1]
+        else:
+            mask_np = np.full((1, 1, 1), float(mask_np.flat[0]) if mask_np.size else 1.0, dtype=np.float32)
+
+        if mask_np.shape[-1] == 1:
+            mask_np = mask_np * np.ones((1, 1, 3), dtype=np.float32)
+
+        return cv2.resize(mask_np, dsize=tuple(map(int, res)), interpolation=cv2.INTER_NEAREST)
 
     def draw_high_res_text(self, text, canvas):
         cv2.putText(canvas, text, (30, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), thickness=5)
@@ -226,10 +256,10 @@ class FusionFilterBase(Filter):
     def _dummy_debug(img: torch.Tensor) -> dict:
         return {
             "filter_parameters": img.new_zeros((1,)),
-            "mask": img.new_ones((1, 1, 1, 1)),
+            "mask": img.new_ones((1, 1, 1)),
         }
 
-    def _get_vi_ir(self, img: torch.Tensor, extra) -> tuple[torch.Tensor, torch.Tensor]:
+    def _get_vi_ir(self, img: torch.Tensor, extra) -> Tuple[torch.Tensor, torch.Tensor]:
         vi = ensure_3ch(img)
         ir = None
         if isinstance(extra, dict):
@@ -316,11 +346,9 @@ class IFCNNFusionFilter(FusionFilterBase):
         vi_n = imagenet_normalize(torch.clip(vi, 0.0, 1.0))
         ir_n = imagenet_normalize(torch.clip(ir, 0.0, 1.0))
 
-        if self.trainable:
-            out_n = self.ifcnn(vi_n, ir_n)
-        else:
-            with torch.no_grad():
-                out_n = self.ifcnn(vi_n, ir_n)
+        # NOTE: Even when IFCNN weights are frozen, we still run without `no_grad()`
+        # so gradients can flow to upstream modules (e.g., IR preprocessing).
+        out_n = self.ifcnn(vi_n, ir_n)
 
         out = imagenet_denormalize(out_n)
         out = torch.clip(out, 0.0, 1.0)
@@ -526,6 +554,73 @@ class LogToneMapFilter(Filter):
             self.draw_high_res_text(f'LogTone {k:.2f}', canvas)
 
 
+class AGCFilter(Filter):
+    """Simple learnable automatic gain control (global contrast normalization).
+
+    Uses per-image mean/std to estimate low/high:
+      low = mean - s * std
+      high = mean + s * std
+    then applies linear stretch + gamma.
+    """
+
+    def __init__(self, cfg, predict=False):
+        Filter.__init__(self, cfg, 'AGC', 3, predict)
+        self.num_filter_parameters = 3
+
+    def filter_param_regressor(self, features):
+        s_min, s_max = getattr(self.cfg, "agc_std_scale_range", (0.5, 4.0))
+        g_min, g_max = getattr(self.cfg, "agc_gamma_range", (0.6, 1.8))
+        s_init = float(getattr(self.cfg, "agc_std_scale_init", (float(s_min) + float(s_max)) * 0.5))
+        g_init = float(getattr(self.cfg, "agc_gamma_init", 1.0))
+        s = tanh_range(float(s_min), float(s_max), initial=s_init)(features[:, 0:1])
+        gamma = tanh_range(float(g_min), float(g_max), initial=g_init)(features[:, 1:2])
+        strength = torch.sigmoid(features[:, 2:3])
+        return torch.cat([s, gamma, strength], dim=1)
+
+    @staticmethod
+    def _get_luminance(img: torch.Tensor) -> torch.Tensor:
+        if img.shape[1] == 1:
+            return img
+        return rgb2lum(img)
+
+    def process(self, img, param):
+        img = torch.clip(img, min=0.0, max=1.0)
+        s = torch.relu(param[:, 0:1])[:, :, None, None]
+        gamma = torch.relu(param[:, 1:2])[:, :, None, None]
+        strength = torch.clip(param[:, 2:3], 0.0, 1.0)[:, :, None, None]
+
+        lum = self._get_luminance(img)
+        mean = lum.mean(dim=(2, 3), keepdim=True)
+        var = torch.mean((lum - mean) ** 2, dim=(2, 3), keepdim=True)
+        std = torch.sqrt(torch.clamp(var, min=1e-8))
+
+        low = mean - s * std
+        high = mean + s * std
+        denom = torch.clamp(high - low, min=1e-6)
+        lum_n = torch.clamp((lum - low) / denom, 0.0, 1.0)
+
+        inv_gamma = 1.0 / torch.clamp(gamma, min=1e-3)
+        lum_g = torch.pow(torch.clamp(lum_n, min=1e-6), inv_gamma)
+
+        if img.shape[1] == 1:
+            out = lum_g
+        else:
+            out = img * (lum_g / (lum + 1e-6))
+
+        out = torch.clip(out, 0.0, 1.0)
+        return img * (1.0 - strength) + out * strength
+
+    def visualize_filter(self, debug_info, canvas):
+        s = float(debug_info['filter_parameters'][0].detach().cpu().numpy())
+        g = float(debug_info['filter_parameters'][1].detach().cpu().numpy())
+        a = float(debug_info['filter_parameters'][2].detach().cpu().numpy())
+        if canvas.shape[0] == 64:
+            cv2.rectangle(canvas, (2, 40), (62, 52), (1, 1, 1), cv2.FILLED)
+            cv2.putText(canvas, f'AGC s{s:.2f} g{g:.2f} a{a:.2f}', (2, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.23, (0, 0, 0))
+        else:
+            self.draw_high_res_text(f'AGC {s:.2f} {g:.2f} {a:.2f}', canvas)
+
+
 class ToneFilterV2(Filter):
 
     def __init__(self, cfg, predict=False):
@@ -586,6 +681,109 @@ class ContrastFilter(Filter):
         exposure = debug_info['filter_parameters'][0].detach().cpu().numpy()
         cv2.rectangle(canvas, (8, 40), (56, 52), (1, 1, 1), cv2.FILLED)
         cv2.putText(canvas, 'Ct %+.2f' % exposure, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0))
+
+
+class StretchCLAHEFilter(Filter):
+    """Grayscale stretch + CLAHE (thermal-friendly enhancement).
+
+    Pipeline:
+    1) Global stretch (mean +/- s*std) into [0,1]
+    2) CLAHE on luminance (cv2 by default in eval; torch approximation in training)
+    """
+
+    def __init__(self, cfg, predict=False):
+        Filter.__init__(self, cfg, 'CLH', 3, predict)
+        self.num_filter_parameters = 3
+        self._clahe = None
+
+    def filter_param_regressor(self, features):
+        s_min, s_max = getattr(self.cfg, "stretch_std_scale_range", (0.5, 4.0))
+        clip_min, clip_max = getattr(self.cfg, "clahe_clip_limit_range", (1.0, 8.0))
+        s_init = float(getattr(self.cfg, "stretch_std_scale_init", (float(s_min) + float(s_max)) * 0.5))
+        clip_init = float(getattr(self.cfg, "clahe_clip_limit_init", 2.0))
+        s = tanh_range(float(s_min), float(s_max), initial=s_init)(features[:, 0:1])
+        clip_limit = tanh_range(float(clip_min), float(clip_max), initial=clip_init)(features[:, 1:2])
+        strength = torch.sigmoid(features[:, 2:3])
+        return torch.cat([s, clip_limit, strength], dim=1)
+
+    @staticmethod
+    def _get_luminance(img: torch.Tensor) -> torch.Tensor:
+        if img.shape[1] == 1:
+            return img
+        return rgb2lum(img)
+
+    @staticmethod
+    def _stretch01(lum: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        mean = lum.mean(dim=(2, 3), keepdim=True)
+        var = torch.mean((lum - mean) ** 2, dim=(2, 3), keepdim=True)
+        std = torch.sqrt(torch.clamp(var, min=1e-8))
+        low = mean - s * std
+        high = mean + s * std
+        denom = torch.clamp(high - low, min=1e-6)
+        return torch.clamp((lum - low) / denom, 0.0, 1.0)
+
+    def _clahe_torch_approx(self, lum01: torch.Tensor, clip_limit: torch.Tensor) -> torch.Tensor:
+        tile = int(getattr(self.cfg, "clahe_tile_size", 8))
+        tile = max(2, tile)
+        k = tile * 2 + 1  # smoother than tile
+        if k % 2 == 0:
+            k += 1
+
+        mean = F.avg_pool2d(lum01, kernel_size=k, stride=1, padding=k // 2)
+        mean2 = F.avg_pool2d(lum01 * lum01, kernel_size=k, stride=1, padding=k // 2)
+        std = torch.sqrt(torch.clamp(mean2 - mean * mean, min=1e-6))
+        norm = (lum01 - mean) / (std + 1e-6)
+
+        # Map clip_limit to a reasonable slope; higher clip -> stronger local contrast.
+        clip_min, clip_max = getattr(self.cfg, "clahe_clip_limit_range", (1.0, 8.0))
+        alpha = (clip_limit - float(clip_min)) / (float(clip_max) - float(clip_min) + 1e-6)
+        alpha = 0.7 + 2.3 * torch.clamp(alpha, 0.0, 1.0)  # ~[0.7, 3.0]
+        return torch.clamp(torch.tanh(norm * alpha) * 0.5 + 0.5, 0.0, 1.0)
+
+    def _clahe_cv2(self, lum01: torch.Tensor, clip_limit: torch.Tensor) -> torch.Tensor:
+        tile = int(getattr(self.cfg, "clahe_tile_size", 8))
+        tile = max(2, tile)
+        out = torch.empty_like(lum01)
+        for b in range(lum01.shape[0]):
+            gray = (lum01[b, 0].detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            clahe = cv2.createCLAHE(clipLimit=float(clip_limit[b, 0].detach().cpu().numpy()), tileGridSize=(tile, tile))
+            eq = clahe.apply(gray).astype(np.float32) / 255.0
+            out[b, 0] = torch.from_numpy(eq).to(lum01.device, dtype=lum01.dtype)
+        return out
+
+    def process(self, img, param):
+        img = torch.clip(img, min=0.0, max=1.0)
+        s = torch.relu(param[:, 0:1])[:, :, None, None]
+        clip_limit = torch.relu(param[:, 1:2])
+        strength = torch.clip(param[:, 2:3], 0.0, 1.0)[:, :, None, None]
+
+        lum = self._get_luminance(img)
+        lum_stretched = self._stretch01(lum, s)
+
+        backend = getattr(self.cfg, "clahe_backend", "auto")
+        use_cv2 = (backend == "cv2") or (backend == "auto" and (not self.training))
+        if use_cv2:
+            lum_eq = self._clahe_cv2(lum_stretched, clip_limit)
+        else:
+            lum_eq = self._clahe_torch_approx(lum_stretched, clip_limit[:, :, None, None])
+
+        if img.shape[1] == 1:
+            out = lum_eq
+        else:
+            out = img * (lum_eq / (lum + 1e-6))
+
+        out = torch.clip(out, 0.0, 1.0)
+        return img * (1.0 - strength) + out * strength
+
+    def visualize_filter(self, debug_info, canvas):
+        s = float(debug_info['filter_parameters'][0].detach().cpu().numpy())
+        c = float(debug_info['filter_parameters'][1].detach().cpu().numpy())
+        a = float(debug_info['filter_parameters'][2].detach().cpu().numpy())
+        if canvas.shape[0] == 64:
+            cv2.rectangle(canvas, (2, 40), (62, 52), (1, 1, 1), cv2.FILLED)
+            cv2.putText(canvas, f'CLH s{s:.2f} c{c:.2f} a{a:.2f}', (2, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.23, (0, 0, 0))
+        else:
+            self.draw_high_res_text(f'CLAHE {s:.2f} {c:.2f} {a:.2f}', canvas)
 
 
 class WNBFilter(Filter):
@@ -834,6 +1032,46 @@ class GaussianDenoiseFilter(Filter):
             cv2.putText(canvas, f'GD s{sigma:.2f} a{strength:.2f}', (4, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (0, 0, 0))
         else:
             self.draw_high_res_text(f'GaussDenoise {sigma:.2f} {strength:.2f}', canvas)
+
+
+class IRGaussianDenoiseFilter(GaussianDenoiseFilter):
+    """Gaussian denoise applied to the infrared branch (dual-branch mode)."""
+
+    branch = "ir"
+
+    def __init__(self, cfg, predict=False):
+        super().__init__(cfg, predict=predict)
+        self.short_name = "iGD"
+
+
+class IRLogToneMapFilter(LogToneMapFilter):
+    """Log tone mapping applied to the infrared branch (dual-branch mode)."""
+
+    branch = "ir"
+
+    def __init__(self, cfg, predict=False):
+        super().__init__(cfg, predict=predict)
+        self.short_name = "iLT"
+
+
+class IRAGCFilter(AGCFilter):
+    """AGC applied to the infrared branch (dual-branch mode)."""
+
+    branch = "ir"
+
+    def __init__(self, cfg, predict=False):
+        super().__init__(cfg, predict=predict)
+        self.short_name = "iAGC"
+
+
+class IRStretchCLAHEFilter(StretchCLAHEFilter):
+    """Stretch+CLAHE applied to the infrared branch (dual-branch mode)."""
+
+    branch = "ir"
+
+    def __init__(self, cfg, predict=False):
+        super().__init__(cfg, predict=predict)
+        self.short_name = "iCLH"
 
 
 class SharpenUSMFilter(Filter):

@@ -8,6 +8,7 @@ import numpy as np
 
 from util import enrich_image_input
 from util import STATE_DROPOUT_BEGIN, STATE_REWARD_DIM, STATE_STEP_DIM, STATE_STOPPED_DIM
+from fusion.ifcnn import build_ifcnn, ensure_3ch, imagenet_denormalize, imagenet_normalize, load_ifcnn_weights
 
 def pdf_sample(pdf, uniform_noise):
     pdf = pdf / (torch.sum(pdf, dim=1, keepdim=True) + 1e-36)
@@ -65,6 +66,10 @@ class Agent(nn.Module):
     def __init__(self, cfg, shape=(16, 64, 64), device='cuda', meta_ccm=None):
         super(Agent, self).__init__()
         self.cfg = cfg
+        self.include_ir_in_agent = bool(cfg.get("include_ir_in_agent", False))
+        self.fuse_after_each_step = bool(cfg.get("fuse_after_each_step", False))
+        self.fuser = None
+        self.fuser_trainable = False
         self.feature_extractor = FeatureExtractor(shape=shape, mid_channels=cfg.base_channels,
                                                   output_dim=cfg.feature_extractor_dims,
                                                   dropout_prob=1.0 - cfg.dropout_keep_prob)
@@ -88,21 +93,34 @@ class Agent(nn.Module):
         self.down_sample = nn.AdaptiveAvgPool2d((shape[1], shape[2]))
         self.runtime = torch.tensor(cfg.filters_runtime, requires_grad=False).to(device)
 
+        if self.fuse_after_each_step:
+            fuse_scheme = int(cfg.get("ifcnn_fuse_scheme", 0))
+            self.fuser = build_ifcnn(fuse_scheme=fuse_scheme, resnet_pretrained=False).to(device)
+            weights_path = cfg.get("ifcnn_weights", None)
+            if weights_path:
+                load_ifcnn_weights(self.fuser, weights_path, map_location="cpu")
+
+            self.fuser_trainable = bool(cfg.get("ifcnn_trainable", False))
+            for p in self.fuser.parameters():
+                p.requires_grad = self.fuser_trainable
+            if not self.fuser_trainable:
+                self.fuser.eval()
+
         # Forced filter selection schedule: step (int) -> filter id (int).
         # Supports the legacy single (force_filter_name, force_filter_step) and an optional
         # cfg.force_filter_schedule mapping, e.g. {0: "NLM", 5: "G"}.
         self.force_filter_ids_by_step = {}
-        legacy_step = getattr(cfg, "force_filter_step", None)
-        legacy_name = getattr(cfg, "force_filter_name", None)
+        legacy_step = cfg.get("force_filter_step", None)
+        legacy_name = cfg.get("force_filter_name", None)
         if legacy_name is None:
-            legacy_name = getattr(cfg, "force_filter_short_name", None)
+            legacy_name = cfg.get("force_filter_short_name", None)
         if legacy_name is not None and legacy_step is not None:
             for i, f in enumerate(self.filters):
                 if f.get_short_name() == str(legacy_name):
                     self.force_filter_ids_by_step[int(legacy_step)] = int(i)
                     break
 
-        schedule = getattr(cfg, "force_filter_schedule", None)
+        schedule = cfg.get("force_filter_schedule", None)
         if schedule:
             items = schedule.items() if isinstance(schedule, dict) else schedule
             for step, name in items:
@@ -117,12 +135,39 @@ class Agent(nn.Module):
                         break
 
         self.disallow_after_step0_ids = []
-        disallow_names = getattr(cfg, "disallow_filter_short_names_after_step0", None)
+        disallow_names = cfg.get("disallow_filter_short_names_after_step0", None)
         if disallow_names:
             disallow_set = set(disallow_names)
             for i, f in enumerate(self.filters):
                 if f.get_short_name() in disallow_set:
                     self.disallow_after_step0_ids.append(int(i))
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.fuse_after_each_step and self.fuser is not None and not self.fuser_trainable:
+            self.fuser.eval()
+        return self
+
+    @staticmethod
+    def _ir_as_gray(ir: torch.Tensor) -> torch.Tensor:
+        if ir.dim() != 4:
+            raise ValueError(f"Expected IR as NCHW, got shape={tuple(ir.shape)}")
+        if ir.shape[1] == 1:
+            return ir
+        if ir.shape[1] == 3:
+            return (0.27 * ir[:, 0:1] + 0.67 * ir[:, 1:2] + 0.06 * ir[:, 2:3])
+        raise ValueError(f"Expected IR with 1 or 3 channels, got C={ir.shape[1]}")
+
+    def _fuse_vi_ir(self, vi: torch.Tensor, ir: torch.Tensor) -> torch.Tensor:
+        if self.fuser is None:
+            return vi
+        vi = torch.clip(ensure_3ch(vi), 0.0, 1.0)
+        ir = torch.clip(ensure_3ch(ir), 0.0, 1.0)
+        vi_n = imagenet_normalize(vi)
+        ir_n = imagenet_normalize(ir)
+        out_n = self.fuser(vi_n, ir_n)
+        out = imagenet_denormalize(out_n)
+        return torch.clip(out, 0.0, 1.0)
 
     def forward(self, inp, progress, high_res=None, selected_filter_id=None):
         train = 1 if self.training else 0
@@ -131,13 +176,20 @@ class Agent(nn.Module):
             x, z, states, extra = inp
         else:
             x, z, states = inp
+        ir = None
+        if isinstance(extra, dict):
+            ir = extra.get("ir", None)
 
         selection_noise = z[:, 0:1]
         filtered_images = []
         filter_debug_info = []
         high_res_outputs = []
+        ir_candidates = [] if (self.fuse_after_each_step and ir is not None) else None
 
         x_down = self.down_sample(x)
+        if self.include_ir_in_agent and ir is not None:
+            ir_down = self.down_sample(self._ir_as_gray(ir))
+            x_down = torch.cat([x_down, ir_down], dim=1)
         if self.cfg.shared_feature_extractor:
             filter_features = self.feature_extractor(enrich_image_input(self.cfg, x_down, states))
         else:
@@ -146,9 +198,17 @@ class Agent(nn.Module):
         for j, filter in enumerate(self.filters):
             # print('    creating filter:', j, 'name:', str(filter.__class__), 'abbr.', filter.get_short_name())
             # print('      filter_features:', filter_features.shape)
-            filtered_image_batch, high_res_output, per_filter_debug_info = filter(
-                x, filter_features, high_res=high_res, extra=extra
-            )
+            if ir_candidates is not None and getattr(filter, "branch", None) == "ir":
+                ir_out, _, per_filter_debug_info = filter(ir, filter_features, high_res=None, extra=None)
+                filtered_image_batch = x
+                high_res_output = high_res if high_res is not None else None
+                ir_candidates.append(ir_out)
+            else:
+                filtered_image_batch, high_res_output, per_filter_debug_info = filter(
+                    x, filter_features, high_res=high_res, extra=extra
+                )
+                if ir_candidates is not None:
+                    ir_candidates.append(ir)
             high_res_outputs.append(high_res_output)
             filtered_images.append(filtered_image_batch)
             filter_debug_info.append(per_filter_debug_info)
@@ -218,6 +278,13 @@ class Agent(nn.Module):
         surrogate = torch.sum(filter_one_hot * torch.log(pdf + 1e-10), dim=1, keepdim=True)
 
         x = torch.sum(filtered_images * filter_one_hot[:, :, None, None, None], dim=1)
+        selected_ir = None
+        if ir_candidates is not None:
+            selected_ir = torch.sum(torch.stack(ir_candidates, dim=1) * filter_one_hot[:, :, None, None, None], dim=1)
+
+        # Dual-branch mode: always fuse (VIF) after the chosen branch operation.
+        if self.fuse_after_each_step and selected_ir is not None:
+            x = self._fuse_vi_ir(x, selected_ir)
         if high_res is not None:
             high_res_outputs = torch.stack(high_res_outputs, dim=1)
             high_res_output = torch.sum(high_res_outputs * filter_one_hot[:, :, None, None, None], dim=1)
@@ -230,6 +297,8 @@ class Agent(nn.Module):
             'pdf': pdf[0],
             'selected_filter': selected_filter_id,
         }
+        if selected_ir is not None:
+            debug_info["ir"] = selected_ir
 
         # Combined: Three in one 64x64
         #           otherwise returns pdf, detail, mask

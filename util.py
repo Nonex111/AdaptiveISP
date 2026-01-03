@@ -82,7 +82,10 @@ class Dict(dict):
                 self[k] = v
 
     def __getattr__(self, attr):
-        return self[attr]
+        try:
+            return self[attr]
+        except KeyError as exc:
+            raise AttributeError(attr) from exc
 
     def __setattr__(self, key, value):
         self.__setitem__(key, value)

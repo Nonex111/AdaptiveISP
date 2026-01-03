@@ -36,6 +36,7 @@ from util import make_image_grid, Tee, merge_dict, Dict, save_img
 from util import STATE_DROPOUT_BEGIN, STATE_REWARD_DIM, STATE_STEP_DIM, STATE_STOPPED_DIM
 from agent import Agent
 from value import Value
+from thermal_branch import ThermalBaselineISP
 # from config import cfg
 from dataloader import (
     get_noise,
@@ -110,7 +111,7 @@ class DynamicISP:
         if getattr(args, "force_filter_name", None) is not None:
             cfg.force_filter_name = args.force_filter_name
         if getattr(args, "force_filter_step", None) is not None:
-            cfg.force_filter_step = args.force_filter_step if int(args.force_filter_step) >= 0 else None
+            cfg.force_filter_step = int(args.force_filter_step) if int(args.force_filter_step) >= 0 else None
 
         # Optional constraints for NLM strength (kept off by default to preserve original behavior).
         try:
@@ -172,6 +173,38 @@ class DynamicISP:
             cfg.num_state_dim = 3 + len(cfg.filters)
             cfg.z_dim = 3 + len(cfg.filters) * int(getattr(cfg, "z_dim_per_filter", 16))
 
+        # --- VIF: infrared branch mode ---
+        self.ir_branch_mode = getattr(args, "ir_branch_mode", "baseline")
+        cfg.ir_branch_mode = self.ir_branch_mode
+        if self.ir_branch_mode == "dual":
+            # Dual-branch decision/state: action space includes IR filters, and we fuse (IFCNN) after every step.
+            from isp.filters import IRAGCFilter, IRGaussianDenoiseFilter, IRLogToneMapFilter
+
+            cfg.fuse_after_each_step = True
+            cfg.include_ir_in_agent = True
+            cfg.include_ir_in_value = True
+
+            orig_filters = list(getattr(cfg, "filters", []))
+            orig_runtime = list(getattr(cfg, "filters_runtime", []))
+            runtime_map = {}
+            for i, f in enumerate(orig_filters):
+                if i < len(orig_runtime):
+                    runtime_map[getattr(f, "__name__", str(f))] = orig_runtime[i]
+
+            drop_names = {"IFCNNFusionFilter", "MaxFusionFilter", "MeanFusionFilter"}
+            base_filters = [f for f in orig_filters if getattr(f, "__name__", "") not in drop_names]
+            cfg.filters = [IRGaussianDenoiseFilter, IRLogToneMapFilter, IRAGCFilter] + base_filters
+            cfg.filters_runtime = [
+                runtime_map.get(getattr(f, "__name__", str(f)), 0.5) for f in cfg.filters
+            ]
+
+            cfg.num_state_dim = 3 + len(cfg.filters)
+            cfg.z_dim = 3 + len(cfg.filters) * int(getattr(cfg, "z_dim_per_filter", 16))
+        else:
+            cfg.fuse_after_each_step = False
+            cfg.include_ir_in_agent = False
+            cfg.include_ir_in_value = False
+
         # Hyperparameters
         hyp = args.hyp
         if isinstance(hyp, str):
@@ -206,11 +239,14 @@ class DynamicISP:
         self.train_loader = ReplayMemory(cfg, train, train_path, args.imgsz, args.batch_size, gs,
                                             single_cls=False, hyp=hyp, augment=False, cache=False, pad=0.0,
                                             rect=False, image_weights=False, prefix=colorstr('train: '), limit=-1,
-                                            add_noise=args.add_noise, data_name=args.data_name, brightness_range=args.bri_range, 
+                                            add_noise=args.add_noise, data_name=args.data_name, brightness_range=args.bri_range,
                                             noise_level=args.noise_level, use_linear=args.use_linear,
                                             vi_dir_name=getattr(args, "vi_dir_name", "vi"),
                                             ir_dir_name=getattr(args, "ir_dir_name", "ir"),
                                             ir_root=getattr(args, "ir_root", None),
+                                            ir_use_y16=getattr(args, "ir_use_y16", True),
+                                            ir_width=getattr(args, "ir_width", None),
+                                            ir_height=getattr(args, "ir_height", None),
                                             apply_meta_wb_ccm=getattr(args, "apply_meta_wb_ccm", False))
         if val:
             self.val_loader = ReplayMemory(cfg, val, val_path, args.imgsz, args.batch_size, gs,
@@ -221,6 +257,9 @@ class DynamicISP:
                                            vi_dir_name=getattr(args, "vi_dir_name", "vi"),
                                            ir_dir_name=getattr(args, "ir_dir_name", "ir"),
                                            ir_root=getattr(args, "ir_root", None),
+                                           ir_use_y16=getattr(args, "ir_use_y16", True),
+                                           ir_width=getattr(args, "ir_width", None),
+                                           ir_height=getattr(args, "ir_height", None),
                                            apply_meta_wb_ccm=getattr(args, "apply_meta_wb_ccm", False))
             self.val_loader = self.val_loader.get_feed_dict_and_states(8)
         # Model attributes
@@ -244,8 +283,21 @@ class DynamicISP:
         if "disallow_filter_short_names_after_step0" not in cfg:
             cfg.disallow_filter_short_names_after_step0 = None
 
-        self.agent = Agent(cfg, shape=(6 + len(cfg.filters), 64, 64), meta_ccm=cfg.meta_ccm).to(self.device)
-        self.value = Value(cfg, shape=(9 + len(cfg.filters), 64, 64)).to(self.device)
+        if "num_state_dim" not in cfg:
+            cfg.num_state_dim = 3 + len(cfg.filters)
+        if "z_dim" not in cfg:
+            cfg.z_dim = 3 + len(cfg.filters) * int(getattr(cfg, "z_dim_per_filter", 16))
+
+        base_agent_ch = 3 + (1 if bool(getattr(cfg, "include_ir_in_agent", False)) else 0)
+        agent_in_ch = base_agent_ch + (cfg.num_state_dim if cfg.img_include_states else 0)
+        base_value_ch = 3 + (1 if bool(getattr(cfg, "include_ir_in_value", False)) else 0)
+        value_in_ch = base_value_ch + cfg.num_state_dim + 3
+
+        self.agent = Agent(cfg, shape=(agent_in_ch, 64, 64), meta_ccm=cfg.meta_ccm).to(self.device)
+        self.value = Value(cfg, shape=(value_in_ch, 64, 64)).to(self.device)
+        self.thermal_isp = None
+        if args.data_name in ("vif",) and self.ir_branch_mode == "baseline":
+            self.thermal_isp = ThermalBaselineISP(cfg, device=str(self.device)).to(self.device)
         self.args = args
         cfg.max_iter_step = int(self.args.epochs * 1000 // args.batch_size)  # 1000 train images
         if cfg.show_img_num > args.batch_size:
@@ -296,8 +348,16 @@ class DynamicISP:
             ckpt = torch.load(self.args.resume)
             self.agent.load_state_dict(ckpt['agent_model'])
             self.value.load_state_dict(ckpt['value_model'])
+            if self.thermal_isp is not None and 'thermal_model' in ckpt:
+                try:
+                    self.thermal_isp.load_state_dict(ckpt['thermal_model'])
+                except Exception:
+                    pass
 
-        agent_optimizer = torch.optim.Adam(self.agent.parameters(),
+        agent_params = list(self.agent.parameters())
+        if self.thermal_isp is not None:
+            agent_params += list(self.thermal_isp.parameters())
+        agent_optimizer = torch.optim.Adam(agent_params,
                                            lr=self.args.lr)  # , betas=(0.5, 0.9)
         value_optimizer = torch.optim.Adam(self.value.parameters(),
                                            lr=self.args.lr * float(self.cfg.value_lr_mul))  # , betas=(0.5, 0.9)
@@ -342,6 +402,8 @@ class DynamicISP:
                 (feed_dict['im'], feed_dict['label'], feed_dict['path'], feed_dict['shape'], feed_dict['state']))
             extra = None
             ir_imgs = None
+            ir_before = None
+            ir_after = None
             if isinstance(imgs, (tuple, list)) and len(imgs) == 2:
                 imgs, ir_imgs = imgs
             z = torch.from_numpy(feed_dict['z']).to(self.device)
@@ -350,13 +412,21 @@ class DynamicISP:
             imgs = imgs.to(self.device, non_blocking=True).float()  # input 0.0-1.0
             states = states.to(self.device)
             if ir_imgs is not None:
-                ir_imgs = ir_imgs.to(self.device, non_blocking=True).float()
-                extra = {"ir": ir_imgs}
+                ir_before = ir_imgs.to(self.device, non_blocking=True).float()
+                if self.ir_branch_mode == "baseline" and self.thermal_isp is not None:
+                    ir_after, _ = self.thermal_isp(ir_before)
+                    extra = {"ir": ir_after}
+                else:
+                    extra = {"ir": ir_before}
 
             # Forward
             agent_out, agent_debug_out, agent_debugger = self.agent((imgs, z, states, extra), progress)
             retouch, new_states, surrogate, penalty = agent_out
             stopped = new_states[:, STATE_STOPPED_DIM:STATE_STOPPED_DIM + 1]
+            if self.ir_branch_mode == "dual" and isinstance(agent_debug_out, dict) and agent_debug_out.get("ir", None) is not None:
+                ir_after = agent_debug_out["ir"]
+            if ir_before is not None and ir_after is None:
+                ir_after = ir_before
 
             pred_input = self.yolo_model(imgs)
             # detect_input_loss, detect_input_loss_items = compute_loss(pred_input, targets.to(self.device))  # loss scaled by batch_size
@@ -401,7 +471,9 @@ class DynamicISP:
             stopped_detached = stopped.detach()
             with torch.no_grad():
                 if self.cfg.use_TD:
-                    new_value_target = self.value(retouch.detach(), new_states.detach())
+                    new_value_target = self.value(
+                        retouch.detach(), new_states.detach(), ir=(ir_after.detach() if ir_after is not None else None)
+                    )
                     clear_final = torch.gt(
                         new_states[:, STATE_STEP_DIM:STATE_STEP_DIM + 1].detach(),
                         self.cfg.maximum_trajectory_length,
@@ -417,7 +489,7 @@ class DynamicISP:
                 else:
                     q_target = reward_detached
 
-            old_value = self.value(imgs, states)
+            old_value = self.value(imgs, states, ir=ir_before)
             advantage = q_target - old_value
             value_loss = torch.mean(advantage ** 2)
             policy_advantage = advantage.detach()
@@ -472,6 +544,16 @@ class DynamicISP:
                         self.writer.add_histogram('filter_select/id', selected_filter.detach().cpu(), global_step=iter)
 
                     self.writer.add_images('input', torch.clip(imgs[:self.cfg.show_img_num, ...], 0.0, 1.0), global_step=iter, dataformats="NCHW")
+                    if ir_before is not None:
+                        ir_show = ir_before[:self.cfg.show_img_num, ...]
+                        if ir_show.shape[1] == 1:
+                            ir_show = ir_show.repeat(1, 3, 1, 1)
+                        self.writer.add_images('ir/before', torch.clip(ir_show, 0.0, 1.0), global_step=iter, dataformats="NCHW")
+                    if ir_after is not None:
+                        ir_show = ir_after[:self.cfg.show_img_num, ...]
+                        if ir_show.shape[1] == 1:
+                            ir_show = ir_show.repeat(1, 3, 1, 1)
+                        self.writer.add_images('ir/after', torch.clip(ir_show, 0.0, 1.0), global_step=iter, dataformats="NCHW")
                     # self.writer.add_images('retouch', torch.clip(retouch[:self.cfg.show_img_num, ...], 0.0, 1.0), global_step=iter, dataformats="NCHW")
                 except Exception as e:
                     print("write log error!")
@@ -557,8 +639,9 @@ class DynamicISP:
                 self.train_loader.fill_pool()
             else:
                 ir_np = None
-                if ir_imgs is not None:
-                    ir_np = ir_imgs.detach().cpu().numpy()
+                if ir_before is not None:
+                    ir_store = ir_after if (self.ir_branch_mode == "dual" and ir_after is not None) else ir_before
+                    ir_np = ir_store.detach().cpu().numpy()
                 self.train_loader.replace_memory(
                     self.train_loader.images_and_states_to_records(
                         retouch.detach().cpu().numpy(), feed_dict['label'], feed_dict['path'], feed_dict['shape'],
@@ -582,8 +665,25 @@ class DynamicISP:
                     retouch_img_trajs = []
                     retouch = imgs[b].unsqueeze(0).to(self.device)
                     extra_val = None
+                    ir_raw = None
+                    ir_used = None
+                    ir_raw_trajs = []
+                    ir_used_trajs = []
                     if ir_imgs_val is not None:
-                        extra_val = {"ir": ir_imgs_val[b].unsqueeze(0).to(self.device)}
+                        ir_raw = ir_imgs_val[b].unsqueeze(0).to(self.device).float()
+                        if self.ir_branch_mode == "baseline" and self.thermal_isp is not None:
+                            ir_used, _ = self.thermal_isp(ir_raw)
+                        else:
+                            ir_used = ir_raw
+                        extra_val = {"ir": ir_used}
+                        ir_raw_vis = ir_raw[0].detach().cpu().numpy()
+                        if ir_raw_vis.shape[0] == 1:
+                            ir_raw_vis = np.repeat(ir_raw_vis, 3, axis=0)
+                        ir_used_vis = ir_used[0].detach().cpu().numpy()
+                        if ir_used_vis.shape[0] == 1:
+                            ir_used_vis = np.repeat(ir_used_vis, 3, axis=0)
+                        ir_raw_trajs.append(np.transpose(ir_raw_vis, (1, 2, 0)))
+                        ir_used_trajs.append(np.transpose(ir_used_vis, (1, 2, 0)))
                     retouch_img_trajs.append(np.transpose(retouch[0].detach().cpu().numpy(), (1, 2, 0)))
                     noises = torch.from_numpy(np.array([self.train_loader.get_noise(1) for _ in range(self.cfg.test_steps)])).to(self.device)
                     states = torch.from_numpy(self.train_loader.get_initial_states(1)).to(self.device)
@@ -592,6 +692,18 @@ class DynamicISP:
                             (retouch.float(), noises[i], states, extra_val), 1.0
                         )
                         retouch_img_trajs.append(np.transpose(retouch[0].detach().cpu().numpy(), (1, 2, 0)))
+                        if self.ir_branch_mode == "dual" and ir_raw is not None and isinstance(debug_info, dict) and debug_info.get("ir", None) is not None:
+                            ir_used = debug_info["ir"]
+                            extra_val = {"ir": ir_used}
+                        if ir_raw is not None and ir_used is not None:
+                            ir_raw_vis = ir_raw[0].detach().cpu().numpy()
+                            if ir_raw_vis.shape[0] == 1:
+                                ir_raw_vis = np.repeat(ir_raw_vis, 3, axis=0)
+                            ir_used_vis = ir_used[0].detach().cpu().numpy()
+                            if ir_used_vis.shape[0] == 1:
+                                ir_used_vis = np.repeat(ir_used_vis, 3, axis=0)
+                            ir_raw_trajs.append(np.transpose(ir_raw_vis, (1, 2, 0)))
+                            ir_used_trajs.append(np.transpose(ir_used_vis, (1, 2, 0)))
                         states = new_states
 
                         debug_info_list.append(debug_info)
@@ -608,7 +720,8 @@ class DynamicISP:
                     grid = patch + padding
                     steps = len(retouch_img_trajs)
 
-                    fused = np.ones(shape=(grid * 4, grid * steps, 3), dtype=np.float32)
+                    rows = 6 if ir_raw_trajs else 4
+                    fused = np.ones(shape=(grid * rows, grid * steps, 3), dtype=np.float32)
 
                     for i in range(len(retouch_img_trajs)):
                         sx = grid * i
@@ -618,19 +731,33 @@ class DynamicISP:
                             dsize=(patch, patch),
                             interpolation=cv2.INTER_NEAREST)
 
+                    if ir_raw_trajs and ir_used_trajs:
+                        for i in range(len(retouch_img_trajs)):
+                            sx = grid * i
+                            sy = grid
+                            fused[sy:sy + patch, sx:sx + patch] = cv2.resize(
+                                ir_raw_trajs[i],
+                                dsize=(patch, patch),
+                                interpolation=cv2.INTER_NEAREST)
+                            sy = grid * 2
+                            fused[sy:sy + patch, sx:sx + patch] = cv2.resize(
+                                ir_used_trajs[i],
+                                dsize=(patch, patch),
+                                interpolation=cv2.INTER_NEAREST)
+
                     for i in range(len(retouch_img_trajs) - 1):
                         sx = grid * i + grid // 2
-                        sy = grid
+                        sy = grid * (3 if ir_raw_trajs else 1)
                         fused[sy:sy + patch, sx:sx + patch] = cv2.resize(
                             decisions[i],
                             dsize=(patch, patch),
                             interpolation=cv2.INTER_NEAREST)
-                        sy = grid * 2 - padding // 2
+                        sy = grid * (4 if ir_raw_trajs else 2) - padding // 2
                         fused[sy:sy + patch, sx:sx + patch] = cv2.resize(
                             operations[i],
                             dsize=(patch, patch),
                             interpolation=cv2.INTER_NEAREST)
-                        sy = grid * 3 - padding
+                        sy = grid * (5 if ir_raw_trajs else 3) - padding
                         fused[sy:sy + patch, sx:sx + patch] = cv2.resize(
                             masks[i], dsize=(patch, patch), interpolation=cv2.INTER_NEAREST)
 
@@ -668,6 +795,7 @@ class DynamicISP:
                     'iter': iter,
                     'agent_model': self.agent.state_dict(),
                     'value_model': self.value.state_dict(),
+                    'thermal_model': (self.thermal_isp.state_dict() if self.thermal_isp is not None else None),
                     # 'agent_scheduler': agent_scheduler.state_dict(),
                     # 'value_scheduler': value_scheduler.state_dict(),
                     'agent_optimizer': agent_optimizer.state_dict(),
@@ -1065,6 +1193,12 @@ if __name__ == "__main__":
     parser.add_argument("--vi_dir_name", type=str, default="vi", help="visible dir name for paired vif path mapping")
     parser.add_argument("--ir_dir_name", type=str, default="ir", help="infrared dir name for paired vif path mapping")
     parser.add_argument("--ir_root", type=str, default=None, help="optional infrared root dir (overrides vi/ir dir mapping)")
+    add_bool_flag(parser, "--ir_use_y16", default=True, help="thermal raw: use Y16 (else use YUV part if available)")
+    parser.add_argument("--ir_width", type=int, default=None, help="thermal raw: override width (optional)")
+    parser.add_argument("--ir_height", type=int, default=None, help="thermal raw: override height (optional)")
+    parser.add_argument("--ir_branch_mode", type=str, default="baseline", choices=["baseline", "dual"],
+                        help="baseline: fixed thermal ISP (GD+LT+AGC) before fusion; "
+                             "dual: action space includes IR filters and IFCNN fuses after every step")
     add_bool_flag(parser, "--add_noise", default=False, help="add_noise")
     parser.add_argument("--use_linear", action='store_true', default=False, help="use linear noise distribution")
     parser.add_argument("--bri_range", type=float, default=None, nargs='*', help="brightness range, (low, high), 0.0~1.0")
@@ -1104,8 +1238,10 @@ if __name__ == "__main__":
     parser.add_argument("--val_save_path", type=str, default='experiments/adaptiveisp')
     parser.add_argument("--steps", type=int, default=5, help="steps")
     parser.add_argument("--cfg", type=str, default="config", help="config py file")
-    parser.add_argument("--force_filter_name", type=str, default="IF", help="force selecting this filter short name (e.g., IF)")
-    parser.add_argument("--force_filter_step", type=int, default=-1, help="0-indexed step to force filter selection; <0 disables")
+    parser.add_argument("--force_filter_name", type=str, default=None,
+                        help="force selecting this filter short name (e.g., IF); default uses cfg.force_filter_name")
+    parser.add_argument("--force_filter_step", type=int, default=None,
+                        help="0-indexed step to force filter selection; -1 disables; default uses cfg.force_filter_step")
     parser.add_argument("--ifcnn_weights", type=str, default=None, help="IFCNN weights path (for IFCNNFusionFilter)")
     add_bool_flag(parser, "--ifcnn_trainable", default=None, help="fine-tune IFCNN weights during training")
     parser.add_argument("--ifcnn_fuse_scheme", type=int, default=None, help="IFCNN fuse scheme: 0=MAX, 1=SUM, 2=MEAN")

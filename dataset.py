@@ -6,8 +6,14 @@ import os
 import hashlib
 import math
 import gzip
+from functools import lru_cache
+from typing import Optional
 
 import sys
+# Allow running from within `AdaptiveISP/` without requiring PYTHONPATH=..
+_VIF_BENCHMARK_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _VIF_BENCHMARK_ROOT not in sys.path:
+    sys.path.append(_VIF_BENCHMARK_ROOT)
 sys.path.append("yolov3")
 
 from yolov3.utils.dataloaders import LoadImagesAndLabels
@@ -19,7 +25,7 @@ from yolov3.utils.general import (DATASETS_DIR, LOGGER, NUM_THREADS, TQDM_BAR_FO
 
 from isp.unprocess_np import unprocess_wo_mosaic
 from util import AsyncTaskManager
-from common.raw_reader import process_hq_dng_file
+from common.raw_reader import process_hq_dng_file, process_thermal_raw_file
 
 from multiprocessing.pool import Pool, ThreadPool
 from tqdm import tqdm
@@ -1080,16 +1086,72 @@ def _pair_ir_path(
     vi_path: str,
     vi_dir_name: str = "vi",
     ir_dir_name: str = "ir",
-    ir_root: str | None = None,
+    ir_root: Optional[str] = None,
 ) -> str:
     if ir_root:
-        return str(Path(ir_root) / Path(vi_path).name)
+        candidate = Path(ir_root) / Path(vi_path).name
+    else:
+        token_src = f"{os.sep}{vi_dir_name}{os.sep}"
+        token_dst = f"{os.sep}{ir_dir_name}{os.sep}"
+        if token_src in vi_path:
+            candidate = Path(vi_path.replace(token_src, token_dst))
+        else:
+            candidate = Path(vi_path)
 
-    token_src = f"{os.sep}{vi_dir_name}{os.sep}"
-    token_dst = f"{os.sep}{ir_dir_name}{os.sep}"
-    if token_src in vi_path:
-        return vi_path.replace(token_src, token_dst)
-    return vi_path
+    if candidate.exists():
+        return str(candidate)
+
+    # Try common infrared/raw extensions with the same stem.
+    stem = Path(vi_path).stem
+    ir_dir = candidate.parent
+    for ext in ("", ".raw", ".y16", ".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp", ".npy"):
+        alt = ir_dir / f"{stem}{ext}"
+        if alt.exists():
+            return str(alt)
+
+    # Fallback: match by leading digits (e.g., "0003_*.dng" -> "0003_*.raw").
+    digits = []
+    for ch in Path(vi_path).name:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    prefix = "".join(digits)
+    if prefix:
+        try:
+            return _build_ir_prefix_index(str(ir_dir)).get(prefix, str(candidate))
+        except Exception:
+            pass
+
+    return str(candidate)
+
+
+@lru_cache(maxsize=256)
+def _build_ir_prefix_index(ir_dir: str) -> dict:
+    """Build a mapping: leading-digits prefix -> first matching IR filepath in that directory."""
+    mapping = {}
+    if not ir_dir or not os.path.isdir(ir_dir):
+        return mapping
+    try:
+        names = sorted(os.listdir(ir_dir))
+    except Exception:
+        return mapping
+    for name in names:
+        if not name or name.startswith("."):
+            continue
+        full = os.path.join(ir_dir, name)
+        if not os.path.isfile(full):
+            continue
+        digits = []
+        for ch in name:
+            if ch.isdigit():
+                digits.append(ch)
+            else:
+                break
+        prefix = "".join(digits)
+        if prefix and prefix not in mapping:
+            mapping[prefix] = full
+    return mapping
 
 
 class LoadImagesAndLabelsVIFReplay(LoadImagesAndLabels):
@@ -1119,7 +1181,11 @@ class LoadImagesAndLabelsVIFReplay(LoadImagesAndLabels):
         limit=-1,
         vi_dir_name: str = "vi",
         ir_dir_name: str = "ir",
-        ir_root: str | None = None,
+        ir_root: Optional[str] = None,
+        ir_use_y16: bool = True,
+        ir_width: Optional[int] = None,
+        ir_height: Optional[int] = None,
+        vi_apply_wb_ccm: bool = False,
     ):
         super().__init__(path, img_size, batch_size, augment, hyp, rect, image_weights, cache_images, single_cls, stride, pad, min_items, prefix, limit)
         self.synchronous = False
@@ -1129,6 +1195,10 @@ class LoadImagesAndLabelsVIFReplay(LoadImagesAndLabels):
         self.vi_dir_name = vi_dir_name
         self.ir_dir_name = ir_dir_name
         self.ir_root = ir_root
+        self.ir_use_y16 = bool(ir_use_y16)
+        self.ir_width = ir_width
+        self.ir_height = ir_height
+        self.vi_apply_wb_ccm = bool(vi_apply_wb_ccm)
         self._warned_ir = False
 
     def __getitem__(self, index):
@@ -1142,34 +1212,96 @@ class LoadImagesAndLabelsVIFReplay(LoadImagesAndLabels):
         if mosaic:
             raise NotImplementedError("VIF paired dataset does not support mosaic/mixup yet.")
 
-        # Load visible image from base loader (BGR uint8)
-        vi_bgr, (h0, w0), (h, w) = self.load_image(index)
-
-        # Load infrared image (grayscale or BGR uint8) and align to visible size before letterbox.
         vi_path = self.im_files[index]
+
+        # Load visible (RGB float32 in [0,1])
+        vi_rgb = None
+        if vi_path.lower().endswith(".dng"):
+            vi_tensor = process_hq_dng_file(vi_path, output_channels=3, apply_wb_ccm=self.vi_apply_wb_ccm)
+            if vi_tensor is not None:
+                vi_rgb = vi_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.float32)
+        if vi_rgb is None:
+            vi_bgr = cv2.imread(vi_path, cv2.IMREAD_UNCHANGED)
+            if vi_bgr is None:
+                raise FileNotFoundError(f"Image Not Found {vi_path}")
+            if vi_bgr.ndim == 2:
+                vi_bgr = cv2.cvtColor(vi_bgr, cv2.COLOR_GRAY2BGR)
+            elif vi_bgr.ndim == 3 and vi_bgr.shape[2] >= 3:
+                vi_bgr = vi_bgr[:, :, :3]
+            else:
+                raise ValueError(f"Unsupported visible image shape: {vi_bgr.shape} ({vi_path})")
+
+            vi_rgb = vi_bgr[:, :, ::-1].astype(np.float32)
+            if np.issubdtype(vi_bgr.dtype, np.integer):
+                denom = float(np.iinfo(vi_bgr.dtype).max)
+                vi_rgb = vi_rgb / max(1.0, denom)
+            else:
+                maxv = float(np.max(vi_rgb)) if vi_rgb.size else 1.0
+                if maxv > 1.5:
+                    vi_rgb = vi_rgb / maxv
+        vi_rgb = np.clip(vi_rgb, 0.0, 1.0)
+
+        h0, w0 = vi_rgb.shape[:2]
+        r = self.img_size / max(h0, w0)
+        if r != 1:
+            interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+            vi_rgb = cv2.resize(vi_rgb, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+        h, w = vi_rgb.shape[:2]
+
+        # Load infrared (prefer raw Y16/YUV) -> grayscale float32 [0,1], then resize to visible.
         ir_path = _pair_ir_path(vi_path, vi_dir_name=self.vi_dir_name, ir_dir_name=self.ir_dir_name, ir_root=self.ir_root)
-        ir = cv2.imread(ir_path, cv2.IMREAD_UNCHANGED)
-        if ir is None:
-            if not self._warned_ir:
-                LOGGER.warning(f"Infrared image not found, falling back to visible grayscale. Example: {ir_path}")
-                self._warned_ir = True
-            ir = cv2.cvtColor(vi_bgr, cv2.COLOR_BGR2GRAY)
+        ir_gray = None
+        if ir_path.lower().endswith((".raw", ".y16")):
+            # Thermal RAW has the same logical-crop size as the visible DNG.
+            # Use visible dimensions directly to avoid any extra inference.
+            thermal_width = self.ir_width if self.ir_width is not None else int(w0)
+            thermal_height = self.ir_height if self.ir_height is not None else int(h0)
+            ir_tensor = process_thermal_raw_file(
+                ir_path,
+                use_y16=self.ir_use_y16,
+                width=thermal_width,
+                height=thermal_height,
+                output_channels=1,
+                reference_dir=None,
+            )
+            if ir_tensor is not None:
+                ir_gray = ir_tensor.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
 
-        if ir.ndim == 2:
-            ir_bgr = cv2.cvtColor(ir, cv2.COLOR_GRAY2BGR)
-        elif ir.ndim == 3 and ir.shape[2] >= 3:
-            ir_bgr = ir[:, :, :3]
-        else:
-            ir_bgr = cv2.cvtColor(vi_bgr, cv2.COLOR_BGR2GRAY)
-            ir_bgr = cv2.cvtColor(ir_bgr, cv2.COLOR_GRAY2BGR)
+        if ir_gray is None:
+            ir_img = cv2.imread(ir_path, cv2.IMREAD_UNCHANGED)
+            if ir_img is None:
+                if not self._warned_ir:
+                    LOGGER.warning(f"Infrared image not found, falling back to visible luminance. Example: {ir_path}")
+                    self._warned_ir = True
+                ir_gray = (0.27 * vi_rgb[:, :, 0] + 0.67 * vi_rgb[:, :, 1] + 0.06 * vi_rgb[:, :, 2]).astype(np.float32)
+            else:
+                if ir_img.ndim == 3 and ir_img.shape[2] >= 3:
+                    ir_img = cv2.cvtColor(ir_img[:, :, :3], cv2.COLOR_BGR2GRAY)
+                elif ir_img.ndim != 2:
+                    raise ValueError(f"Unsupported infrared image shape: {ir_img.shape} ({ir_path})")
 
-        if ir_bgr.shape[:2] != vi_bgr.shape[:2]:
-            ir_bgr = cv2.resize(ir_bgr, (vi_bgr.shape[1], vi_bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
+                ir_f32 = ir_img.astype(np.float32)
+                if np.issubdtype(ir_img.dtype, np.integer):
+                    # Normalize to [0,1] (min-max for 16-bit/Y16 style inputs).
+                    minv = float(ir_f32.min()) if ir_f32.size else 0.0
+                    maxv = float(ir_f32.max()) if ir_f32.size else 1.0
+                    if maxv > minv:
+                        ir_gray = (ir_f32 - minv) / (maxv - minv)
+                    else:
+                        ir_gray = ir_f32 * 0.0
+                else:
+                    maxv = float(np.max(ir_f32)) if ir_f32.size else 1.0
+                    ir_gray = ir_f32 if maxv <= 1.5 else (ir_f32 / maxv)
+
+        if ir_gray.shape[:2] != (h, w):
+            ir_gray = cv2.resize(ir_gray, (w, h), interpolation=cv2.INTER_LINEAR)
+        ir_gray = np.clip(ir_gray, 0.0, 1.0)
+        ir_rgb = np.repeat(ir_gray[:, :, None], 3, axis=2)
 
         # Letterbox both with identical target shape.
         shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size
-        vi_bgr, ratio, pad = letterbox(vi_bgr, shape, auto=False, scaleup=self.augment, color=(0, 0, 0))
-        ir_bgr, _, _ = letterbox(ir_bgr, shape, auto=False, scaleup=self.augment, color=(0, 0, 0))
+        vi_rgb, ratio, pad = letterbox(vi_rgb, shape, auto=False, scaleup=self.augment, color=(0, 0, 0))
+        ir_rgb, _, _ = letterbox(ir_rgb, shape, auto=False, scaleup=self.augment, color=(0, 0, 0))
         shapes = (h0, w0), ((h / h0, w / w0), pad)
 
         labels = self.labels[index].copy()
@@ -1178,19 +1310,17 @@ class LoadImagesAndLabelsVIFReplay(LoadImagesAndLabels):
 
         nl = len(labels)
         if nl:
-            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=vi_bgr.shape[1], h=vi_bgr.shape[0], clip=True, eps=1e-3)
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=vi_rgb.shape[1], h=vi_rgb.shape[0], clip=True, eps=1e-3)
 
         labels_out = torch.zeros((nl, 6))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
-        # Convert images to RGB float NCHW
-        vi = vi_bgr.transpose((2, 0, 1))[::-1]
-        ir_rgb = ir_bgr.transpose((2, 0, 1))[::-1]
-        vi = np.ascontiguousarray(vi) / 255.0
-        ir_rgb = np.ascontiguousarray(ir_rgb) / 255.0
+        # Convert images to float NCHW (RGB order); keep infrared as 1-channel.
+        vi = np.ascontiguousarray(vi_rgb.transpose((2, 0, 1))).astype(np.float32)
+        ir_chw = np.ascontiguousarray(ir_rgb.transpose((2, 0, 1))[:1]).astype(np.float32)
 
-        return (torch.from_numpy(vi), torch.from_numpy(ir_rgb)), labels_out, self.im_files[index], shapes
+        return (torch.from_numpy(vi), torch.from_numpy(ir_chw)), labels_out, self.im_files[index], shapes
 
     def get_next_batch_(self, batch_size):
         batch = []
