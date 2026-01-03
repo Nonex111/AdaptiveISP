@@ -1,4 +1,4 @@
-# YOLOv3 🚀 by Ultralytics, AGPL-3.0 license
+# YOLOv3 🚀 by Ultralytics, AGPL-3.0 licenseyolo_model = 
 """
 Loss functions
 """
@@ -133,6 +133,11 @@ class ComputeLoss:
             if n:
                 # pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
                 pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
+
+                # Support masking: extract first self.nc classes if head has more (e.g. 80 classes weights used for 4 classes task)
+                res_subset = pi[b, a, gj, gi]
+                pxy, pwh, pobj, pcls_all = res_subset.split((2, 2, 1, res_subset.shape[-1] - 5), 1)
+                pcls = pcls_all[:, :self.nc]
 
                 # Regression
                 pxy = pxy.sigmoid() * 2 - 0.5

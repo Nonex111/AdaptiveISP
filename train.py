@@ -220,9 +220,23 @@ class DynamicISP:
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(args.weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-        yolo_model = Model(args.yolo_cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(
-            self.device)  # create
+        # Determine the number of classes for model initialization
+        # If we are using COCO weights and want to use them as an "off-the-shelf" detector,
+        # we should initialize with 80 classes so weights (including Detect head) match.
+        ckpt_nc = ckpt['model'].yaml.get('nc', 80) if hasattr(ckpt['model'], 'yaml') else 80
+        LOGGER.info(f"Detector checkpoint has nc={ckpt_nc}. Initializing model with nc={ckpt_nc} to load full weights.")
+        
+        yolo_model = Model(args.yolo_cfg or ckpt['model'].yaml, ch=3, nc=ckpt_nc, anchors=hyp.get('anchors')).to(
+            self.device)  # create with ckpt_nc (usually 80)
+        
         exclude = ['anchor'] if (args.yolo_cfg or hyp.get('anchors')) and not resume else []  # exclude keys
+        # Now set model.nc to the actual dataset nc (4) for loss calculation
+        yolo_model.nc = nc 
+               # Update the Detect head's nc as well so ComputeLoss uses the correct task nc
+        if hasattr(yolo_model, 'model'):
+            yolo_model.model[-1].nc = nc
+        LOGGER.info(f"Model internal nc set to {nc} for task-specific loss calculation.")
+
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, yolo_model.state_dict(), exclude=exclude)  # intersect
         yolo_model.load_state_dict(csd, strict=False)  # load
